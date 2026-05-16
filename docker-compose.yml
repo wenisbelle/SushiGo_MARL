@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  vision_dev:
+    image: marl:latest
+    container_name: marl_container
+    hostname: marl_container
+    runtime: nvidia
+    environment:
+      - QT_X11_NO_MITSHM=1
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - NVIDIA_VISIBLE_DEVICES=all
+      - DISPLAY
+    devices:
+      - /dev/dri  # for GPU access
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - ./src:/MARL/src:rw  # Mount the current directory as readable and writable
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+              
+    stdin_open: true
+    tty: true
+    restart: "no"
+    network_mode: "host"  # Add this line to use the host network
+    command: /bin/bash  # Add this line to start a bash shell
