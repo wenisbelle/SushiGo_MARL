@@ -25,6 +25,8 @@ HOW THE PIECES MAP TO DQN
 """
 import argparse
 import warnings
+import sys 
+import os
 
 import torch
 from torch import nn
@@ -36,6 +38,8 @@ from torchrl.envs import check_env_specs, ParallelEnv
 from torchrl.modules import EGreedyModule, MultiAgentMLP, QValueModule
 from torchrl.objectives import DQNLoss, SoftUpdate, ValueEstimators
 
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../SushiGo_env')))
 from SushiGo_env.sushi_go_env import N_TYPES
 from SushiGo_env.torchrl_integration import make_torchrl_env, OBS_KEY, MASK_KEY, GROUP, ACTION_KEY
 
