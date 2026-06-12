@@ -116,6 +116,7 @@ class SushiGoParallelEnv(ParallelEnv):
         history_len: int | None = None,
         include_opponent_tableaus: bool = True,
         reward_scale: float = 1.0,
+        zero_sum_rewards: bool = False,
         render_mode=None,
     ):
         assert 2 <= n_players <= MAX_PLAYERS, "n_players must be in [2, 4]"
@@ -129,6 +130,7 @@ class SushiGoParallelEnv(ParallelEnv):
         assert self.history_len >= 0
         self.include_opponent_tableaus = include_opponent_tableaus
         self.reward_scale = reward_scale
+        self.zero_sum_rewards = zero_sum_rewards
         self.render_mode = render_mode
         self.last_rewards = [0.0 for _ in range(n_players)]
         self.cards_discarted = np.zeros(N_TYPES, dtype=np.int64)
@@ -240,6 +242,16 @@ class SushiGoParallelEnv(ParallelEnv):
                     infos[agent]["pudding_score"] = float(pud_scores[p])
                 terminations = {a: True for a in acting}
                 self.agents = []
+
+        if self.zero_sum_rewards:
+            if self.n_players != 2:
+                raise ValueError("zero_sum_rewards=True is only supported for 2-player training")
+
+            a0, a1 = acting
+            r0 = rewards[a0]
+            r1 = rewards[a1]
+            rewards[a0] = r0 - r1
+            rewards[a1] = r1 - r0
 
         rewards = {a: r * self.reward_scale for a, r in rewards.items()}
         observations = {a: self._obs_for(p) for p, a in enumerate(acting)}
