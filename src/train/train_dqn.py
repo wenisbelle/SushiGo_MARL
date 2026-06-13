@@ -52,7 +52,7 @@ CHOSEN_VALUE_KEY = (GROUP, "chosen_action_value")   # Q of the action actually t
 NUM_WORKERS = 4 
 
 
-def build_qvalue_actor(n_players, obs_dim, num_cells=128, depth=2, device="cpu"):
+def build_qvalue_actor(n_players, obs_dim, num_cells=128, depth=3, device="cpu"):
     """Shared-parameter multi-agent Q-network + masked argmax head."""
     q_net = MultiAgentMLP(
         n_agent_inputs=obs_dim,
@@ -190,11 +190,11 @@ def train(args):
 def get_args():
     p = argparse.ArgumentParser()
     p.add_argument("--n-players", type=int, default=2, choices=[2, 3, 4])
-    p.add_argument("--iterations", type=int, default=500)
+    p.add_argument("--iterations", type=int, default=5000)
     p.add_argument("--frames-per-batch", type=int, default=5000)
     p.add_argument("--buffer-size", type=int, default=100_000)
-    p.add_argument("--batch-size", type=int, default=512)
-    p.add_argument("--updates-per-batch", type=int, default=16)
+    p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--updates-per-batch", type=int, default=8)
     p.add_argument("--lr", type=float, default=2.5e-4)
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--target-eps", type=float, default=0.995)  # SoftUpdate mix factor
