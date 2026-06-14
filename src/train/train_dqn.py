@@ -27,11 +27,12 @@ import argparse
 import warnings
 import sys 
 import os
+import csv
 
 import torch
 from torch import nn
 from tensordict.nn import TensorDictModule, TensorDictSequential
-from torchrl.collectors import SyncDataCollector, MultiSyncDataCollector
+from torchrl.collectors import Collector, MultiSyncCollector
 from torchrl.data import TensorDictReplayBuffer
 from torchrl.data.replay_buffers import LazyTensorStorage
 from torchrl.envs import check_env_specs, ParallelEnv
@@ -49,7 +50,22 @@ warnings.filterwarnings("ignore")
 ACTION_VALUE_KEY = (GROUP, "action_value")          # the 12 Q-values
 CHOSEN_VALUE_KEY = (GROUP, "chosen_action_value")   # Q of the action actually taken
 
-NUM_WORKERS = 4 
+NUM_WORKERS = 12
+
+
+def log_progress_to_csv(filepath, iteration, loss, epsilon, mean_reward, mean_return):
+    """Appends training metrics to a CSV file. Creates the file and headers if it doesn't exist."""
+    file_exists = os.path.isfile(filepath)
+    
+    with open(filepath, mode='a', newline='') as file:
+        writer = csv.writer(file)
+        
+        # Write header if the file is being created for the first time
+        if not file_exists:
+            writer.writerow(["iteration", "loss", "epsilon", "mean_turn_reward", "mean_episode_return"])
+        
+        # Write the current metrics
+        writer.writerow([iteration, loss, epsilon, mean_reward, mean_return])
 
 
 def build_qvalue_actor(n_players, obs_dim, num_cells=128, depth=3, device="cpu"):
@@ -137,7 +153,7 @@ def train(args):
         return make_torchrl_env(
             n_players=args.n_players, reward_scale=args.reward_scale, device="cpu")
 
-    collector = MultiSyncDataCollector(
+    collector = MultiSyncCollector(
         create_env_fn=[env_factory] * NUM_WORKERS,
         policy=collector_policy,
         frames_per_batch=args.frames_per_batch,   # split across workers automatically
@@ -175,11 +191,22 @@ def train(args):
         ep_ret = batch.get(("next", GROUP, "episode_reward"))
         finished = ep_ret[done]
         eps_now = explore.eps.item() if hasattr(explore.eps, "item") else float(explore.eps)
+        mean_return = finished.float().mean().item() if finished.numel() > 0 else ""
+        
         msg = (f"iter {it:3d} | loss={last_loss:.4f} | eps={eps_now:.3f} "
                f"| mean turn reward={mean_r:+.3f}")
-        if finished.numel() > 0:
-            msg += f" | mean episode return/seat={finished.float().mean().item():+.2f}"
+        if mean_return != "":
+            msg += f" | mean episode return/seat={mean_return:+.2f}"
         print(msg)
+
+        log_progress_to_csv(
+            filepath="training_log.csv",
+            iteration=it,
+            loss=last_loss,
+            epsilon=eps_now,
+            mean_reward=mean_r,
+            mean_return=mean_return
+        )
 
     if not args.smoke:
         torch.save(qvalue_actor.state_dict(), args.save_path)
@@ -189,7 +216,7 @@ def train(args):
 
 def get_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--n-players", type=int, default=2, choices=[2, 3, 4])
+    p.add_argument("--n-players", type=int, default=4, choices=[2, 3, 4])
     p.add_argument("--iterations", type=int, default=5000)
     p.add_argument("--frames-per-batch", type=int, default=5000)
     p.add_argument("--buffer-size", type=int, default=100_000)
@@ -202,7 +229,7 @@ def get_args():
     p.add_argument("--reward-scale", type=float, default=0.1)
     p.add_argument("--cuda", action="store_true")
     p.add_argument("--smoke", action="store_true", help="tiny wiring-check run")
-    p.add_argument("--save-path", type=str, default="sushi_go_qnet_2_players.pt")
+    p.add_argument("--save-path", type=str, default="sushi_go_qnet_4_players.pt")
     return p.parse_args()
 
 
