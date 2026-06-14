@@ -12,42 +12,52 @@ paradigm with `pettingzoo.utils.parallel_to_aec` if your training stack needs it
 
 OBSERVATION DESIGN
 
-Each agent's observation is a flat float vector with four sections, plus an
-`action_mask`. The observation is built ego-centrically (from that agent's seat).
+Each agent's observation is a structured DictSpace plus two masks. The state
+features are built ego-centrically (from that agent's seat) and are kept as named
+arrays so transformer/encoder models can consume sequential parts directly.
+`flatten_observation()` converts the same fields back to the legacy deterministic
+flat order for simple MLP baselines.
 
   1. current_hand        : counts of each of the 12 card types in the hand the
                            agent is holding RIGHT NOW (the hand it drafts from).
 
-  2. hand_history        : a rolling memory of the last `history_len` hands the
+  2. hand_history        : a fixed-length sequence of the last `history_len` hands the
                            agent has seen this round, most-recent-first. Each
                            remembered hand is a 12-vector of card-type counts,
                            recorded AS THE AGENT RECEIVED IT (before it drafted).
                            This is imperfect information: slot k holds the hand
                            seen k turns ago, and since then k other players have
                            drafted from it, so that memory is k drafts STALE.
-                           `history_len` defaults to `n_players - 1`, i.e. exactly
-                           one lap of the table — after that the hand would have
-                           come all the way back around and the memory is
-                           completely outdated, so it drops out of the buffer.
-                           Slots are zero-filled at the start of each round before
-                           the buffer has filled.
+                           `history_len` defaults to `max_n_players - 1` so the
+                           shape is stable even when the active player count is
+                           sampled on reset. Missing slots are filled with -1.0,
+                           the padding sentinel used by the encoder.
 
   3. own_tableau         : the agent's own cards on the table — 12 type counts
                            plus [unused_wasabi, pudding_total].
 
-  4. opponent_tableaus   : every opponent's cards on the table (public info in
-                           Sushi Go), ordered by seat offset, each as 12 counts
-                           plus [unused_wasabi, pudding_total]. Disable with
+  4. opponent_tableaus   : a fixed-length sequence of opponent tableaus (public
+                           info in Sushi Go), ordered by seat offset, each as 12
+                           counts plus [unused_wasabi, pudding_total]. When fewer
+                           than `max_n_players` seats are active, unavailable
+                           opponent slots are filled with -1.0. Disable with
                            `include_opponent_tableaus=False`.
 
-   5. cards_played    : counts of each of the 12 card types descarted by all
-                            players so far this round 
+  5. cards_played        : normalized counts of each of the 12 card types
+                           discarded/played by all players so far this round.
 
   + game_scalars         : [round_index / 3, cards_in_hand / hand_size].
 
-The observation size depends on `n_players` and `history_len` (a fresh env is
-created per player count for training). `split_observation()` decodes a raw
-vector back into named sections for debugging.
+  + action_mask          : legal card-type actions for this specific seat.
+
+  + player_mask          : boolean scalar for this dense slot. It is True for
+                           active seats and False for inactive padded seats.
+                           After TorchRL groups the PettingZoo agents, these
+                           scalars form the dense player-axis mask.
+
+The observation specs depend on `max_n_players` and `history_len`, not the
+sampled active count. This lets replay buffers and TorchRL collectors batch games
+with different active player counts in the same static tensor shapes.
 
 
 ACTION DESIGN
@@ -97,6 +107,22 @@ DUMPLING_SCORE = [0, 1, 3, 6, 10, 15]  # index = dumpling count, clamped at 5
 
 MAX_PLAYERS = 4
 N_ROUNDS = 3
+PADDING_VALUE = -1.0
+"""Sentinel for inactive agents and unavailable sequence rows.
+
+The external transformer encoder treats all--1 rows as padding. Valid Sushi Go
+counts/scalars are non-negative, so -1 is unambiguous for this environment.
+"""
+
+OBS_COMPONENTS = (
+    "current_hand",
+    "hand_history",
+    "own_tableau",
+    "opponent_tableaus",
+    "cards_played",
+    "game_scalars",
+)
+"""Feature order used when flattening structured observations for MLP baselines."""
 
 
 def hand_size_for(n_players: int) -> int:
@@ -106,46 +132,72 @@ def hand_size_for(n_players: int) -> int:
 
 # Environment
 class SushiGoParallelEnv(ParallelEnv):
-    """Sushi Go! as a PettingZoo ParallelEnv (2-4 players)."""
+    """Sushi Go! as a PettingZoo ParallelEnv with dense variable-player slots.
+
+    `n_players` is kept as the fixed-count compatibility shortcut. For stochastic
+    player counts, pass `n_players=None` with `min_n_players`/`max_n_players`.
+    Specs and `possible_agents` always use `max_n_players`; each reset samples
+    `active_n_players`, and inactive dense slots are masked/padded.
+    """
 
     metadata = {"render_modes": ["human"], "name": "sushi_go_v2", "is_parallelizable": True}
 
     def __init__(
         self,
-        n_players: int = 3,
+        n_players: int | None = 3,
+        min_n_players: int | None = None,
+        max_n_players: int | None = None,
         history_len: int | None = None,
         include_opponent_tableaus: bool = True,
         reward_scale: float = 1.0,
         render_mode=None,
     ):
-        assert 2 <= n_players <= MAX_PLAYERS, "n_players must be in [2, 4]"
+        if n_players is not None and (min_n_players is not None or max_n_players is not None):
+            raise ValueError("Use either n_players or min_n_players/max_n_players, not both.")
+        if n_players is not None:
+            min_n_players = max_n_players = n_players
+        if min_n_players is None:
+            min_n_players = 3
+        if max_n_players is None:
+            max_n_players = min_n_players
+        assert 2 <= min_n_players <= max_n_players <= MAX_PLAYERS, (
+            "player count bounds must satisfy 2 <= min_n_players <= max_n_players <= 4"
+        )
         super().__init__()
 
-        self.n_players = n_players
-        self.hand_size = hand_size_for(n_players)
-        # One lap of the table = n_players hands; the n_players-1 *previous* hands
-        # span exactly up to the point where the info becomes fully outdated.
-        self.history_len = (n_players - 1) if history_len is None else history_len
+        self.min_n_players = min_n_players
+        self.max_n_players = max_n_players
+        # `n_players` tracks the active count for old callers/tests. Shape-bearing
+        # structures below use `max_n_players` so specs stay fixed across resets.
+        self.n_players = max_n_players
+        self.active_n_players = max_n_players
+        self.hand_size = hand_size_for(self.active_n_players)
+        # One lap of the largest table = max_n_players hands; reserving that many
+        # history slots lets a 2p/3p episode be padded into the same observation spec.
+        self.history_len = (max_n_players - 1) if history_len is None else history_len
         assert self.history_len >= 0
         self.include_opponent_tableaus = include_opponent_tableaus
         self.reward_scale = reward_scale
         self.render_mode = render_mode
-        self.last_rewards = [0.0 for _ in range(n_players)]
+        self.last_rewards = np.zeros(self.max_n_players, dtype=np.float64)
         self.cards_discarted = np.zeros(N_TYPES, dtype=np.int64)
+        self.player_mask = np.ones(self.max_n_players, dtype=bool)
 
-        self.possible_agents = [f"player_{i}" for i in range(n_players)]
+        self.possible_agents = [f"player_{i}" for i in range(max_n_players)]
         self.agents = list(self.possible_agents)
 
-        # observation layout (named slices into the flat vector) 
-        n_opp = (n_players - 1) if include_opponent_tableaus else 0
-        sizes = [
-            ("current_hand", N_TYPES),                       
-            ("hand_history", self.history_len * N_TYPES),    
-            ("own_tableau", N_TYPES + 2),                    
-            ("opponent_tableaus", n_opp * (N_TYPES + 2)),
-            ("cards_played", N_TYPES),   
-            ("game_scalars", 2),
-        ]
+        # Shapes for the structured observation leaves. These drive both the
+        # Gymnasium spaces and the legacy flat-vector slice map.
+        n_opp = (max_n_players - 1) if include_opponent_tableaus else 0
+        self.obs_shapes = {
+            "current_hand": (N_TYPES,),
+            "hand_history": (self.history_len, N_TYPES),
+            "own_tableau": (N_TYPES + 2,),
+            "opponent_tableaus": (n_opp, N_TYPES + 2),
+            "cards_played": (N_TYPES,),
+            "game_scalars": (2,),
+        }
+        sizes = [(name, int(np.prod(self.obs_shapes[name]))) for name in OBS_COMPONENTS]
         self.obs_slices, cursor = {}, 0
         for name, size in sizes:
             self.obs_slices[name] = (cursor, cursor + size)
@@ -159,10 +211,21 @@ class SushiGoParallelEnv(ParallelEnv):
     #  spaces
     @functools.lru_cache(maxsize=None)
     def observation_space(self, agent):
-        return DictSpace({
-            "observation": Box(low=-1.0, high=50.0, shape=(self.obs_dim,), dtype=np.float32),
+        """Return the per-agent structured observation space.
+
+        `player_mask` is intentionally scalar here: PettingZoo emits one value per
+        dense slot, and TorchRL stacks those scalars into a `[max_n_players, 1]`
+        grouped mask.
+        """
+        obs_space = {
+            name: Box(low=-1.0, high=50.0, shape=shape, dtype=np.float32)
+            for name, shape in self.obs_shapes.items()
+        }
+        obs_space.update({
             "action_mask": Box(low=0, high=1, shape=(N_TYPES,), dtype=np.int8),
+            "player_mask": Box(low=0, high=1, shape=(), dtype=bool),
         })
+        return DictSpace(obs_space)
 
     @functools.lru_cache(maxsize=None)
     def action_space(self, agent):
@@ -170,21 +233,28 @@ class SushiGoParallelEnv(ParallelEnv):
 
     # core lifecycle
     def reset(self, seed=None, options=None):
+        """Start a new game, sampling the active player count for this episode."""
         if seed is not None:
             self.rng = np.random.default_rng(seed)
 
         self.agents = list(self.possible_agents)
+        # Active seats are always the dense prefix player_0..player_{n-1}. Keeping
+        # stable slot identity avoids remapping observations/actions between turns.
+        self.active_n_players = int(self.rng.integers(self.min_n_players, self.max_n_players + 1))
+        self.n_players = self.active_n_players
+        self.hand_size = hand_size_for(self.active_n_players)
+        self.player_mask = np.arange(self.max_n_players) < self.active_n_players
 
         deck = []
         for card, count in DECK_COMPOSITION.items():
             deck += [card] * count
         self.deck = [int(x) for x in self.rng.permutation(deck)]
 
-        self.pudding_total = np.zeros(self.n_players, dtype=np.int64)
+        self.pudding_total = np.zeros(self.max_n_players, dtype=np.int64)
         self.round_idx = 1
         self.turn = 0
-        self.last_rewards = [0.0 for _ in range(self.n_players)]
-        self.cards_played = np.zeros(N_TYPES, dtype=np.int64)
+        self.last_rewards = np.zeros(self.max_n_players, dtype=np.float64)
+        self.cards_discarted = np.zeros(N_TYPES, dtype=np.int64)
         self._deal_round()  # deals hands; clears tableaus and hand-history memory
 
         observations = {a: self._obs_for(i) for i, a in enumerate(self.agents)}
@@ -192,14 +262,20 @@ class SushiGoParallelEnv(ParallelEnv):
         return observations, infos
 
     def step(self, actions):
+        """Apply one simultaneous draft for all active players.
+
+        Inactive dense slots remain in `self.agents` for static tensor shapes, but
+        gameplay loops only touch `active_n_players`. Their rewards stay zero and
+        observations are regenerated as padded inactive observations.
+        """
         acting = list(self.agents)
 
         # Snapshot each hand AS SEEN this turn (before anyone drafts) — this is what
         # players will remember in their hand_history.
-        snapshots = [self._hand_counts(p) for p in range(self.n_players)]
+        snapshots = [self._hand_counts(p) for p in range(self.active_n_players)]
 
         # Each player drafts one card of the chosen type.
-        for p, agent in enumerate(acting):
+        for p, agent in enumerate(acting[:self.active_n_players]):
             a = int(actions[agent])
             hand = self.hands[p]
             if a not in hand:  # graceful fallback for invalid (unmasked) actions
@@ -216,7 +292,7 @@ class SushiGoParallelEnv(ParallelEnv):
         round_over = len(self.hands[0]) == 0
         current_scores = self._score_turn()
         turn_scores = current_scores - self.last_rewards        
-        for p, agent in enumerate(acting):
+        for p, agent in enumerate(acting[:self.active_n_players]):
                 rewards[agent] += float(turn_scores[p])
                 infos[agent]["turn_score"] = float(turn_scores[p])
         self.last_rewards = current_scores
@@ -224,18 +300,20 @@ class SushiGoParallelEnv(ParallelEnv):
         if not round_over:
             # Each player files away the hand it just saw, then hands pass one seat
             # along: new_hands[i] = old_hands[i-1].
-            for p in range(self.n_players):
+            for p in range(self.active_n_players):
                 self.seen_history[p].insert(0, snapshots[p])
                 del self.seen_history[p][self.history_len:]
-            self.hands = [self.hands[(i - 1) % self.n_players]
-                          for i in range(self.n_players)]
+            self.hands[:self.active_n_players] = [
+                self.hands[(i - 1) % self.active_n_players]
+                for i in range(self.active_n_players)
+            ]
         else:            
             if self.round_idx < N_ROUNDS:
                 self.round_idx += 1
                 self._deal_round()  # clears tableaus + hand-history, deals new hands
             else:
                 pud_scores = self._score_pudding()  # pudding scored once, at game end
-                for p, agent in enumerate(acting):
+                for p, agent in enumerate(acting[:self.active_n_players]):
                     rewards[agent] += float(pud_scores[p])
                     infos[agent]["pudding_score"] = float(pud_scores[p])
                 terminations = {a: True for a in acting}
@@ -250,20 +328,20 @@ class SushiGoParallelEnv(ParallelEnv):
     # dealing & card placement 
     def _deal_round(self):
         """Clear per-round state (tableaus + hand-history) and deal fresh hands."""
-        self.tableau = [np.zeros(N_TYPES, dtype=np.int64) for _ in range(self.n_players)]
+        self.tableau = [np.zeros(N_TYPES, dtype=np.int64) for _ in range(self.max_n_players)]
         self.nigiri_on_wasabi = [np.zeros(N_TYPES, dtype=np.int64)
-                                 for _ in range(self.n_players)]
-        self.wasabi_unused = [0 for _ in range(self.n_players)]
-        self.seen_history = [[] for _ in range(self.n_players)]  # hand memory resets
-        self.last_rewards = [0.0 for _ in range(self.n_players)]
+                                 for _ in range(self.max_n_players)]
+        self.wasabi_unused = [0 for _ in range(self.max_n_players)]
+        self.seen_history = [[] for _ in range(self.max_n_players)]  # hand memory resets
+        self.last_rewards = np.zeros(self.max_n_players, dtype=np.float64)
         self.hands = [
-            [self.deck.pop() for _ in range(self.hand_size)]
-            for _ in range(self.n_players)
+            [self.deck.pop() for _ in range(self.hand_size)] if p < self.active_n_players else []
+            for p in range(self.max_n_players)
         ]
 
     def _place_card(self, p, card):
         """Add a drafted card to player p's tableau, handling pudding and wasabi."""
-        self.cards_played[card] += 1
+        self.cards_discarted[card] += 1
         if card == PUDDING:
             self.pudding_total[p] += 1
         elif card in NIGIRI_VALUE:
@@ -286,8 +364,8 @@ class SushiGoParallelEnv(ParallelEnv):
     # scoring 
     def _score_turn(self):
         """Score tempura / sashimi / dumpling / nigiri+wasabi / maki for the round."""
-        n = self.n_players
-        scores = np.zeros(n, dtype=np.float64)
+        n = self.active_n_players
+        scores = np.zeros(self.max_n_players, dtype=np.float64)
         for p in range(n):
             t = self.tableau[p]
             scores[p] += (t[TEMPURA] // 2) * 5            # 2 tempura -> 5
@@ -301,8 +379,12 @@ class SushiGoParallelEnv(ParallelEnv):
             sum(self.tableau[p][m] * icons for m, icons in MAKI_ICONS.items())
             for p in range(n)
         ])
-        scores += self._score_maki(maki_counts)
+        scores[:n] += self._score_maki(maki_counts)
         return scores
+
+    def _score_round(self):
+        """Backward-compatible alias for tests/scripts using the old name."""
+        return self._score_turn()
 
     @staticmethod
     def _score_maki(counts):
@@ -326,9 +408,9 @@ class SushiGoParallelEnv(ParallelEnv):
 
     def _score_pudding(self):
         """End-of-game pudding: most -> +6, least -> -6 (no penalty in a 2-player game)."""
-        n = self.n_players
-        out = np.zeros(n, dtype=np.float64)
-        pud = self.pudding_total
+        n = self.active_n_players
+        out = np.zeros(self.max_n_players, dtype=np.float64)
+        pud = self.pudding_total[:n]
         most = [i for i in range(n) if pud[i] == pud.max()]
         for i in most:
             out[i] += 6 // len(most)
@@ -347,45 +429,88 @@ class SushiGoParallelEnv(ParallelEnv):
         ])
 
     def _obs_for(self, p):
-        """Ego-centric observation for player p."""
-        parts = [self._hand_counts(p)]  # 1. current hand
+        """Ego-centric structured observation for dense slot `p`.
 
-        # 2. hand history: last `history_len` hands seen, most-recent-first, padded.
+        Active slots get real game state plus padded sequence rows where the
+        current episode has fewer seats than `max_n_players`. Inactive slots get
+        every feature filled with `PADDING_VALUE`, `player_mask=False`, and a
+        harmless one-hot action mask so masked action selection never receives an
+        all-false legal-action vector.
+        """
+        if p >= self.active_n_players:
+            obs = self._inactive_observation()
+            mask = np.zeros(N_TYPES, dtype=np.int8)
+            mask[0] = 1
+            obs.update({"action_mask": mask, "player_mask": np.bool_(False)})
+            return obs
+
+        current_hand = self._hand_counts(p)
+
+        # Hand history is sequential input for the encoder. Empty history rows use
+        # the same all--1 sentinel as missing opponents.
+        hand_history = np.full(self.obs_shapes["hand_history"], PADDING_VALUE, dtype=np.float32)
         hist = self.seen_history[p]
         for k in range(self.history_len):
-            parts.append(hist[k] if k < len(hist) else np.zeros(N_TYPES, dtype=np.float32))
+            if k < len(hist):
+                hand_history[k] = hist[k]
 
-        # 3. own tableau
-        parts.append(self._tableau_block(p))
-
-        # 4. opponents' tableaus, ordered by seat offset (ego-centric)
+        # Opponent tableaus are ordered by seat offset from the observing player.
+        # Slots beyond the sampled active table size remain padding.
+        opponent_tableaus = np.full(self.obs_shapes["opponent_tableaus"], PADDING_VALUE, dtype=np.float32)
         if self.include_opponent_tableaus:
-            for off in range(1, self.n_players):
-                parts.append(self._tableau_block((p + off) % self.n_players))
+            for off in range(1, self.max_n_players):
+                if off < self.active_n_players:
+                    opponent_tableaus[off - 1] = self._tableau_block((p + off) % self.active_n_players)
 
-        # 5. cards_discarted
         DECK_COUNTS = np.array([DECK_COMPOSITION[i] for i in range(N_TYPES)], dtype=np.float32)
-        parts.append(self.cards_discarted / DECK_COUNTS)
-
-        # game scalars
-        parts.append(np.array([
+        cards_played = self.cards_discarted / DECK_COUNTS
+        game_scalars = np.array([
             self.round_idx / N_ROUNDS,
             len(self.hands[p]) / self.hand_size,
-        ], dtype=np.float32))
+        ], dtype=np.float32)
 
-        obs = np.concatenate(parts).astype(np.float32)
-        assert obs.shape[0] == self.obs_dim, (obs.shape[0], self.obs_dim)
         mask = (self._hand_counts(p) > 0).astype(np.int8)
-        return {"observation": obs, "action_mask": mask}
+        return {
+            "current_hand": current_hand.astype(np.float32),
+            "hand_history": hand_history,
+            "own_tableau": self._tableau_block(p),
+            "opponent_tableaus": opponent_tableaus,
+            "cards_played": cards_played.astype(np.float32),
+            "game_scalars": game_scalars,
+            "action_mask": mask,
+            "player_mask": np.bool_(True),
+        }
+
+    def _inactive_observation(self):
+        """Return all-padded feature leaves for an inactive dense player slot."""
+        return {
+            name: np.full(shape, PADDING_VALUE, dtype=np.float32)
+            for name, shape in self.obs_shapes.items()
+        }
+
+    def flatten_observation(self, obs):
+        """Flatten a structured observation dict in the deterministic model order.
+
+        This is the compatibility bridge for MLP/DQN baselines. Encoder models
+        should consume the structured leaves directly.
+        """
+        return np.concatenate([
+            np.asarray(obs[name], dtype=np.float32).reshape(-1)
+            for name in OBS_COMPONENTS
+        ]).astype(np.float32)
 
     def split_observation(self, obs_vector):
-        """Decode a flat observation vector into its named sections (debugging aid)."""
-        return {name: np.asarray(obs_vector)[s:e] for name, (s, e) in self.obs_slices.items()}
+        """Decode a flat compatibility vector into named sections for debugging."""
+        flat = np.asarray(obs_vector, dtype=np.float32)
+        return {
+            name: flat[s:e].reshape(self.obs_shapes[name])
+            for name, (s, e) in self.obs_slices.items()
+        }
 
     # ---- misc -------------------------------------------------------------------------
     def render(self):
         lines = [f"--- Round {self.round_idx} | turn {self.turn} ---"]
-        for p in range(self.n_players):
+        for p in range(self.active_n_players):
             tab = ", ".join(f"{CARD_NAMES[c]}x{int(self.tableau[p][c])}"
                             for c in range(N_TYPES) if self.tableau[p][c] > 0)
             lines.append(f"  player_{p}: [{tab}]  pudding={self.pudding_total[p]}")

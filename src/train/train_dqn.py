@@ -12,7 +12,8 @@ based. For the policy-gradient analogue (IPPO) reuse the actor/critic in
 
 HOW THE PIECES MAP TO DQN
 =========================
-  Q-network          : MultiAgentMLP, obs -> 12 Q-values (one per card type).
+  Q-network          : structured obs -> deterministic flat vector ->
+                       MultiAgentMLP -> 12 Q-values (one per card type).
   Action selection   : QValueModule does a *masked* argmax — illegal cards (not in
                        hand) are excluded via the env's action_mask.
   Exploration        : EGreedyModule, epsilon annealed over training; random picks
@@ -22,8 +23,17 @@ HOW THE PIECES MAP TO DQN
   Replay buffer      : transitions stored and sampled i.i.d. (off-policy).
   Loss               : DQNLoss with a TD(0) target.
 
+VARIABLE PLAYER COUNTS
+======================
+The environment keeps a dense player axis of `max_n_players`, but each reset can
+sample fewer active seats. The per-slot `player_mask` is not an action mask; it
+marks which dense slots are real players in the sampled episode. DQN loss and
+training metrics use this mask so padded inactive seats do not contribute zero
+loss/reward and bias learning.
+
 """
 import argparse
+import json
 import warnings
 import sys 
 import os
@@ -34,14 +44,24 @@ from tensordict.nn import TensorDictModule, TensorDictSequential
 from torchrl.collectors import SyncDataCollector, MultiSyncDataCollector
 from torchrl.data import TensorDictReplayBuffer
 from torchrl.data.replay_buffers import LazyTensorStorage
-from torchrl.envs import check_env_specs, ParallelEnv
+from torchrl.envs import check_env_specs
 from torchrl.modules import EGreedyModule, MultiAgentMLP, QValueModule
 from torchrl.objectives import DQNLoss, SoftUpdate, ValueEstimators
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../SushiGo_env')))
 from SushiGo_env.sushi_go_env import N_TYPES
-from SushiGo_env.torchrl_integration import make_torchrl_env, OBS_KEY, MASK_KEY, GROUP, ACTION_KEY
+from SushiGo_env.encoder_adapter import build_encoder_qvalue_actor
+from SushiGo_env.torchrl_integration import (
+    make_observation_flattener,
+    make_torchrl_env,
+    flat_observation_dim,
+    OBS_KEY,
+    MASK_KEY,
+    PLAYER_MASK_KEY,
+    GROUP,
+    ACTION_KEY,
+)
 
 warnings.filterwarnings("ignore")
 
@@ -52,8 +72,21 @@ CHOSEN_VALUE_KEY = (GROUP, "chosen_action_value")   # Q of the action actually t
 NUM_WORKERS = 4 
 
 
-def build_qvalue_actor(n_players, obs_dim, num_cells=128, depth=2, device="cpu"):
-    """Shared-parameter multi-agent Q-network + masked argmax head."""
+def build_qvalue_selector():
+    """Build the masked argmax head shared by baseline and encoder DQN paths."""
+    # QValueModule turns Q-values into a (masked) greedy action. The action_mask_key
+    # makes it exclude cards not in hand BEFORE the argmax — for both the acting
+    # policy and, inside DQNLoss, the bootstrap target.
+    return QValueModule(
+        action_space="categorical", #  means it outputs an integer index
+        action_value_key=ACTION_VALUE_KEY,
+        action_mask_key=MASK_KEY,
+        out_keys=[ACTION_KEY, ACTION_VALUE_KEY, CHOSEN_VALUE_KEY],
+    )
+
+
+def build_mlp_qvalue_actor(n_players, obs_dim, num_cells=128, depth=2, device="cpu"):
+    """Baseline shared-parameter Q-network over flattened structured observations."""
     q_net = MultiAgentMLP(
         n_agent_inputs=obs_dim,
         n_agent_outputs=N_TYPES,      # one Q-value per card type
@@ -66,38 +99,115 @@ def build_qvalue_actor(n_players, obs_dim, num_cells=128, depth=2, device="cpu")
         device=device,
     )
     q_module = TensorDictModule(q_net, in_keys=[OBS_KEY], out_keys=[ACTION_VALUE_KEY])
+    return TensorDictSequential(make_observation_flattener(), q_module, build_qvalue_selector())
 
-    # QValueModule turns Q-values into a (masked) greedy action. The action_mask_key
-    # makes it exclude cards not in hand BEFORE the argmax — for both the acting
-    # policy and, inside DQNLoss, the bootstrap target.
-    qvalue_module = QValueModule(
-        action_space="categorical", #  means it outputs an integer index
-        action_value_key=ACTION_VALUE_KEY,
-        action_mask_key=MASK_KEY,
-        out_keys=[ACTION_KEY, ACTION_VALUE_KEY, CHOSEN_VALUE_KEY],
+
+def build_qvalue_actor(env, n_players, obs_dim, args, device="cpu"):
+    """Build the selected DQN architecture.
+
+    Baseline mode flattens structured observations before an MLP. Encoder mode
+    keeps sequential leaves structured, encodes them with the vendored transformer
+    module, then applies a small Q-head.
+    """
+    if args.use_encoder:
+        return build_encoder_qvalue_actor(
+            env,
+            n_agents=n_players,
+            qvalue_module=build_qvalue_selector(),
+            encoder_output_dim=args.encoder_output_dim,
+            sequential_embed_dim=args.encoder_sequential_embed_dim,
+            sequential_head_dim=args.encoder_sequential_head_dim,
+            sequential_num_heads=args.encoder_sequential_num_heads,
+            sequential_ff_dim=args.encoder_sequential_ff_dim,
+            sequential_depth=args.encoder_sequential_depth,
+            sequential_dropout=args.encoder_sequential_dropout,
+            flat_embed_dim=args.encoder_flat_embed_dim,
+            flat_depth=args.encoder_flat_depth,
+            flat_num_cells=args.encoder_flat_cells,
+            mix_layer_depth=args.encoder_mix_depth,
+            mix_layer_num_cells=args.encoder_mix_cells,
+            q_head_cells=args.encoder_q_cells,
+            q_head_depth=args.encoder_q_depth,
+            device=device,
+        )
+    return build_mlp_qvalue_actor(
+        n_players,
+        obs_dim,
+        num_cells=args.mlp_cells,
+        depth=args.mlp_depth,
+        device=device,
     )
-    return TensorDictSequential(q_module, qvalue_module)
 
+
+def resolve_player_config(args):
+    """Resolve CLI player-count flags into env and model configuration.
+
+    Returns `(n_players, min_n_players, max_n_players, model_n_players)`.
+    `n_players` is used for fixed-count compatibility. For stochastic games,
+    `model_n_players` is the dense max size because `MultiAgentMLP` has a static
+    agent axis.
+    """
+    using_range = args.min_n_players is not None or args.max_n_players is not None
+    if args.n_players is not None and using_range:
+        raise ValueError("Use either --n-players or --min-n-players/--max-n-players, not both.")
+    if args.n_players is not None:
+        return args.n_players, None, None, args.n_players
+
+    if not using_range:
+        return 2, None, None, 2
+
+    min_n_players = 2 if args.min_n_players is None else args.min_n_players
+    max_n_players = min_n_players if args.max_n_players is None else args.max_n_players
+    if not 2 <= min_n_players <= max_n_players <= 4:
+        raise ValueError("player count bounds must satisfy 2 <= min <= max <= 4")
+    return None, min_n_players, max_n_players, max_n_players
+
+
+def masked_mean(value, mask):
+    """Mean over active dense player slots only.
+
+    TorchRL's DQNLoss has no inactive-player mask key, so the loss is requested
+    with `reduction="none"` and reduced here with the current observation's
+    `player_mask`.
+    """
+    mask = mask.to(value.dtype)
+    return (value * mask).sum() / mask.sum().clamp_min(1.0)
 
 
 def train(args):
     device = "cuda" if (args.cuda and torch.cuda.is_available()) else "cpu"
+    n_players, min_n_players, max_n_players, model_n_players = resolve_player_config(args)
 
     if args.smoke:  # tiny run — only checks the pipeline executes end to end
         args.iterations, args.frames_per_batch = 3, 600
         args.buffer_size, args.batch_size, args.updates_per_batch = 2000, 256, 8
 
     total_frames = args.frames_per_batch * args.iterations
-    print(f"device={device}  n_players={args.n_players}  total_frames={total_frames}")
+    player_msg = (
+        f"n_players={n_players}" if n_players is not None
+        else f"n_players=[{min_n_players}, {max_n_players}]"
+    )
+    model_msg = "encoder+DQN" if args.use_encoder else "MLP+DQN"
+    print(f"device={device}  {player_msg}  model={model_msg}  total_frames={total_frames}")
+    print(f"cli_args={json.dumps(vars(args), sort_keys=True)}")
 
     # environment  
     env = make_torchrl_env(
-        n_players=args.n_players, reward_scale=args.reward_scale, device=device)
+        n_players=n_players,
+        min_n_players=min_n_players,
+        max_n_players=max_n_players,
+        reward_scale=args.reward_scale,
+        device=device,
+    )
     check_env_specs(env)
-    obs_dim = env.observation_spec[OBS_KEY].shape[-1]
+    obs_dim = flat_observation_dim(env)
 
-    # Q-network  
-    qvalue_actor = build_qvalue_actor(args.n_players, obs_dim, device=device)
+    # Q-network. In stochastic mode this is sized for max_n_players; inactive
+    # slots are still forwarded, but their losses are masked out below.
+    qvalue_actor = build_qvalue_actor(env, model_n_players, obs_dim, args, device=device)
+    if args.compile:
+        print("compiling Q-network with torch.compile()...")  # speeds up training but adds overhead, so optional
+        qvalue_actor = torch.compile(qvalue_actor)
     qvalue_actor(env.reset())  # warm up lazy parameters with a real observation
     # It must happen before you build the optimizer or the loss, because those need real parameters to attach to.
 
@@ -112,10 +222,16 @@ def train(args):
     )
     collector_policy = TensorDictSequential(qvalue_actor, explore)
 
-    # DQN loss + target network 
+    # DQN loss + target network
     # computes the TD error: the gap between Q(s,a) and the bootstrap target r + γ·max Q(s',·).
-    # delay_value=True is the target network
-    loss_module = DQNLoss(qvalue_actor, action_space="categorical", delay_value=True)
+    # delay_value=True is the target network. reduction="none" preserves the
+    # [batch, n_agents] loss tensor so padded inactive slots can be ignored.
+    loss_module = DQNLoss(
+        qvalue_actor,
+        action_space="categorical",
+        delay_value=True,
+        reduction="none",
+    )
     
     # Define the corrected keys
     loss_module.set_keys(
@@ -135,7 +251,12 @@ def train(args):
     # data collection + replay buffer
     def env_factory():
         return make_torchrl_env(
-            n_players=args.n_players, reward_scale=args.reward_scale, device="cpu")
+            n_players=n_players,
+            min_n_players=min_n_players,
+            max_n_players=max_n_players,
+            reward_scale=args.reward_scale,
+            device=device,
+        )
 
     collector = MultiSyncDataCollector(
         create_env_fn=[env_factory] * NUM_WORKERS,
@@ -158,7 +279,10 @@ def train(args):
         for _ in range(args.updates_per_batch):
             sample = replay.sample()
             loss_vals = loss_module(sample)
-            loss = loss_vals["loss"]
+            # The sampled action/reward belong to the current observation, so use
+            # the current player_mask, not next.player_mask, for loss reduction.
+            active = sample.get(PLAYER_MASK_KEY).squeeze(-1).bool()
+            loss = masked_mean(loss_vals["loss"], active)
             loss.backward()
             nn.utils.clip_grad_norm_(loss_module.parameters(), args.max_grad_norm) # caps the gradient magnitude so a rare huge TD error can't blow up the weights
             optim.step()
@@ -169,11 +293,14 @@ def train(args):
         explore.step(args.frames_per_batch)   # anneal epsilon
         collector.update_policy_weights_()
 
-        # Logging: mean per-turn reward, and per-seat episode return where games ended.
-        mean_r = batch.get(("next", GROUP, "reward")).mean().item()
-        done = batch.get(("next", GROUP, "done"))
-        ep_ret = batch.get(("next", GROUP, "episode_reward"))
-        finished = ep_ret[done]
+        # Logging uses next.player_mask because these rewards/episode returns live
+        # under "next". This prevents inactive padded seats from diluting metrics.
+        active_next = batch.get(("next", *PLAYER_MASK_KEY)).squeeze(-1).bool()
+        reward = batch.get(("next", GROUP, "reward")).squeeze(-1)
+        mean_r = reward[active_next].mean().item()
+        done = batch.get(("next", GROUP, "done")).squeeze(-1).bool()
+        ep_ret = batch.get(("next", GROUP, "episode_reward")).squeeze(-1)
+        finished = ep_ret[done & active_next]
         eps_now = explore.eps.item() if hasattr(explore.eps, "item") else float(explore.eps)
         msg = (f"iter {it:3d} | loss={last_loss:.4f} | eps={eps_now:.3f} "
                f"| mean turn reward={mean_r:+.3f}")
@@ -189,7 +316,9 @@ def train(args):
 
 def get_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--n-players", type=int, default=2, choices=[2, 3, 4])
+    p.add_argument("--n-players", type=int, default=None, choices=[2, 3, 4])
+    p.add_argument("--min-n-players", type=int, default=None, choices=[2, 3, 4])
+    p.add_argument("--max-n-players", type=int, default=None, choices=[2, 3, 4])
     p.add_argument("--iterations", type=int, default=500)
     p.add_argument("--frames-per-batch", type=int, default=5000)
     p.add_argument("--buffer-size", type=int, default=100_000)
@@ -201,7 +330,25 @@ def get_args():
     p.add_argument("--max-grad-norm", type=float, default=10.0)
     p.add_argument("--reward-scale", type=float, default=0.1)
     p.add_argument("--cuda", action="store_true")
+    p.add_argument("--compile", action="store_true", help="torch.compile the Q-network for faster training")
     p.add_argument("--smoke", action="store_true", help="tiny wiring-check run")
+    p.add_argument("--use-encoder", action="store_true", help="use transformer encoder before the DQN Q-head")
+    p.add_argument("--mlp-cells", type=int, default=128)
+    p.add_argument("--mlp-depth", type=int, default=2)
+    p.add_argument("--encoder-output-dim", type=int, default=128)
+    p.add_argument("--encoder-sequential-embed-dim", type=int, default=64)
+    p.add_argument("--encoder-sequential-head-dim", type=int, default=16)
+    p.add_argument("--encoder-sequential-num-heads", type=int, default=4)
+    p.add_argument("--encoder-sequential-ff-dim", type=int, default=128)
+    p.add_argument("--encoder-sequential-depth", type=int, default=2)
+    p.add_argument("--encoder-sequential-dropout", type=float, default=0.0)
+    p.add_argument("--encoder-flat-embed-dim", type=int, default=64)
+    p.add_argument("--encoder-flat-depth", type=int, default=1)
+    p.add_argument("--encoder-flat-cells", type=int, default=128)
+    p.add_argument("--encoder-mix-depth", type=int, default=1)
+    p.add_argument("--encoder-mix-cells", type=int, default=128)
+    p.add_argument("--encoder-q-cells", type=int, default=128)
+    p.add_argument("--encoder-q-depth", type=int, default=1)
     p.add_argument("--save-path", type=str, default="sushi_go_qnet_2_players.pt")
     return p.parse_args()
 
