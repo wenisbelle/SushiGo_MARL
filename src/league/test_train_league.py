@@ -98,7 +98,7 @@ def test_parallelism_is_bounded(tmp_path):
     active = 0
     peak = 0
 
-    def runner(_spec):
+    def runner(_spec, _stop_event):
         nonlocal active, peak
         with lock:
             active += 1
@@ -112,6 +112,30 @@ def test_parallelism_is_bounded(tmp_path):
     assert peak == 2
 
 
+def test_failure_stops_active_and_queued_runs(tmp_path):
+    specs = build_run_specs(["fixed_2p"], 5, tmp_path, use_cuda=False)
+    started = []
+    stopped = []
+    lock = threading.Lock()
+
+    def runner(spec, stop_event):
+        with lock:
+            started.append(spec.repetition)
+        if spec.repetition == 1:
+            time.sleep(0.02)
+            return False
+        while not stop_event.wait(0.01):
+            pass
+        with lock:
+            stopped.append(spec.repetition)
+        return False
+
+    assert not run_pending(specs, parallelism=2, runner=runner)
+    assert 1 in started
+    assert len(started) <= 2
+    assert stopped == [2]
+
+
 def test_successful_run_writes_artifacts_and_completion_marker(tmp_path, monkeypatch):
     spec = build_run_specs(["fixed_2p"], 1, tmp_path, use_cuda=False)[0]
 
@@ -123,6 +147,9 @@ def test_successful_run_writes_artifacts_and_completion_marker(tmp_path, monkeyp
             assert "--num-workers" in command
 
         def wait(self):
+            return 0
+
+        def poll(self):
             return 0
 
     monkeypatch.setattr(

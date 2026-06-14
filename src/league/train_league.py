@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import importlib.metadata
+from itertools import islice
 import json
+import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
+import threading
 from typing import Callable, Sequence
 
 
@@ -197,8 +201,44 @@ def run_metadata(spec: RunSpec, command: Sequence[str]) -> dict[str, object]:
     }
 
 
-def run_training(spec: RunSpec) -> bool:
+class ActiveProcesses:
+    """Track active training process groups so a failed run can stop the league."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._processes: set[subprocess.Popen[str]] = set()
+
+    def add(self, process: subprocess.Popen[str]) -> None:
+        with self._lock:
+            self._processes.add(process)
+
+    def discard(self, process: subprocess.Popen[str]) -> None:
+        with self._lock:
+            self._processes.discard(process)
+
+    def terminate_all(self) -> None:
+        with self._lock:
+            processes = list(self._processes)
+        for process in processes:
+            if process.poll() is not None:
+                continue
+            try:
+                if os.name == "posix":
+                    os.killpg(process.pid, signal.SIGTERM)
+                else:
+                    process.terminate()
+            except ProcessLookupError:
+                pass
+
+
+def run_training(
+    spec: RunSpec,
+    stop_event: threading.Event | None = None,
+    active_processes: ActiveProcesses | None = None,
+) -> bool:
     """Run one subprocess, stream its output, and mark validated success."""
+    if stop_event is not None and stop_event.is_set():
+        return False
     spec.run_dir.mkdir(parents=True, exist_ok=False)
     command = spec.command()
     spec.config_path.write_text(
@@ -214,13 +254,20 @@ def run_training(spec: RunSpec) -> bool:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            start_new_session=True,
         )
+        if active_processes is not None:
+            active_processes.add(process)
         assert process.stdout is not None
-        for line in process.stdout:
-            log_file.write(line)
-            log_file.flush()
-            print(f"[{spec.label}] {line}", end="", flush=True)
-        return_code = process.wait()
+        try:
+            for line in process.stdout:
+                log_file.write(line)
+                log_file.flush()
+                print(f"[{spec.label}] {line}", end="", flush=True)
+            return_code = process.wait()
+        finally:
+            if active_processes is not None:
+                active_processes.discard(process)
 
     artifacts_ok = spec.model_path.is_file() and spec.metrics_path.is_file()
     if return_code == 0 and artifacts_ok:
@@ -241,21 +288,53 @@ def run_training(spec: RunSpec) -> bool:
 def run_pending(
     specs: Sequence[RunSpec],
     parallelism: int,
-    runner: Callable[[RunSpec], bool] = run_training,
+    runner: Callable[[RunSpec, threading.Event], bool] | None = None,
 ) -> bool:
-    """Run all jobs with bounded concurrency and report aggregate success."""
-    succeeded = True
-    with ThreadPoolExecutor(max_workers=parallelism) as executor:
-        futures = {executor.submit(runner, spec): spec for spec in specs}
-        for future in as_completed(futures):
-            spec = futures[future]
-            try:
-                run_ok = future.result()
-            except Exception as error:  # noqa: BLE001 - isolate failed runs
-                print(f"[{spec.label}] FAILED: {error}", file=sys.stderr)
-                run_ok = False
-            succeeded = run_ok and succeeded
-    return succeeded
+    """Run jobs with bounded concurrency, stopping all work on first failure."""
+    stop_event = threading.Event()
+    active_processes = ActiveProcesses()
+
+    if runner is None:
+        def execute(spec: RunSpec, event: threading.Event) -> bool:
+            return run_training(spec, event, active_processes)
+    else:
+        execute = runner
+
+    def execute_unless_stopped(spec: RunSpec) -> bool:
+        if stop_event.is_set():
+            return False
+        return execute(spec, stop_event)
+
+    executor = ThreadPoolExecutor(max_workers=parallelism)
+    remaining_specs = iter(specs)
+    futures = {
+        executor.submit(execute_unless_stopped, spec): spec
+        for spec in islice(remaining_specs, parallelism)
+    }
+    try:
+        while futures:
+            done, _ = wait(futures, return_when=FIRST_COMPLETED)
+            for future in done:
+                spec = futures.pop(future)
+                try:
+                    run_ok = future.result()
+                except Exception as error:  # noqa: BLE001 - stop league on any run error
+                    print(f"[{spec.label}] FAILED: {error}", file=sys.stderr)
+                    run_ok = False
+                if not run_ok:
+                    stop_event.set()
+                    active_processes.terminate_all()
+                    for active_future in futures:
+                        active_future.cancel()
+                    print("League training stopped after a run failure.", file=sys.stderr)
+                    return False
+
+                next_spec = next(remaining_specs, None)
+                if next_spec is not None:
+                    futures[executor.submit(execute_unless_stopped, next_spec)] = next_spec
+        return True
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
