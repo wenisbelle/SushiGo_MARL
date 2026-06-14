@@ -22,12 +22,12 @@ DEFAULT_OUTPUT_ROOT = REPO_ROOT / "results" / "league"
 @dataclass(frozen=True)
 class LeaguePreset:
     name: str
-    player_args: tuple[tuple[str, int], ...]
+    args: tuple[tuple[str, object], ...]
 
     def training_args(self) -> dict[str, object]:
-        """Return the player configuration plus shared league hyperparameters."""
+        """Return preset-specific arguments plus shared league hyperparameters."""
         return {
-            **dict(self.player_args),
+            **dict(self.args),
             "iterations": 5_000,
             "frames_per_batch": 5_000,
             "buffer_size": 100_000,
@@ -53,6 +53,14 @@ PRESETS = {
         LeaguePreset(
             "variable_2_4",
             (("min_n_players", 2), ("max_n_players", 4)),
+        ),
+        LeaguePreset(
+            "variable_encoder_2_4",
+            (
+                ("min_n_players", 2),
+                ("max_n_players", 4),
+                ("use_encoder", True),
+            ),
         ),
     )
 }
@@ -93,7 +101,12 @@ class RunSpec:
         args = self.preset.training_args()
         command = [python_executable, str(TRAIN_SCRIPT)]
         for key, value in args.items():
-            command.extend((f"--{key.replace('_', '-')}", str(value)))
+            flag = f"--{key.replace('_', '-')}"
+            if isinstance(value, bool):
+                if value:
+                    command.append(flag)
+            else:
+                command.extend((flag, str(value)))
         command.extend(("--save-path", str(self.model_path)))
         command.extend(("--log-path", str(self.metrics_path)))
         if self.use_cuda:

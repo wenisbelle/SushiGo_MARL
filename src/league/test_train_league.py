@@ -45,10 +45,26 @@ def test_variable_preset_uses_shared_parameters():
     assert args == EXPECTED_TRAINING_ARGS
 
 
-def test_default_matrix_has_twelve_unique_runs(tmp_path):
+def test_variable_encoder_preset_uses_defaults_and_shared_parameters(tmp_path):
+    args = PRESETS["variable_encoder_2_4"].training_args()
+    assert args.pop("min_n_players") == 2
+    assert args.pop("max_n_players") == 4
+    assert args.pop("use_encoder") is True
+    assert args == EXPECTED_TRAINING_ARGS
+
+    spec = build_run_specs(
+        ["variable_encoder_2_4"], 1, tmp_path, use_cuda=False
+    )[0]
+    command = spec.command("python")
+    assert "--use-encoder" in command
+    assert "True" not in command
+    assert not any(arg.startswith("--encoder-") for arg in command)
+
+
+def test_default_matrix_has_fifteen_unique_runs(tmp_path):
     specs = build_run_specs(list(PRESETS), 3, tmp_path, use_cuda=False)
-    assert len(specs) == 12
-    assert len({spec.run_dir for spec in specs}) == 12
+    assert len(specs) == 15
+    assert len({spec.run_dir for spec in specs}) == 15
 
 
 def test_preflight_skips_complete_and_rejects_incomplete(tmp_path):
