@@ -38,6 +38,7 @@ import warnings
 import sys 
 import os
 import csv
+import time
 
 import torch
 from torch import nn
@@ -70,7 +71,15 @@ warnings.filterwarnings("ignore")
 ACTION_VALUE_KEY = (GROUP, "action_value")          # the 12 Q-values
 CHOSEN_VALUE_KEY = (GROUP, "chosen_action_value")   # Q of the action actually taken
 
-def log_progress_to_csv(filepath, iteration, loss, epsilon, mean_reward, mean_return):
+def log_progress_to_csv(
+    filepath,
+    iteration,
+    elapsed_seconds,
+    loss,
+    epsilon,
+    mean_reward,
+    mean_return,
+):
     """Append one training-metrics row, creating the CSV header when needed."""
     file_exists = os.path.isfile(filepath)
     with open(filepath, mode="a", newline="") as file:
@@ -78,12 +87,32 @@ def log_progress_to_csv(filepath, iteration, loss, epsilon, mean_reward, mean_re
         if not file_exists:
             writer.writerow([
                 "iteration",
+                "elapsed_seconds",
                 "loss",
                 "epsilon",
                 "mean_turn_reward",
                 "mean_episode_return",
             ])
-        writer.writerow([iteration, loss, epsilon, mean_reward, mean_return])
+        writer.writerow([
+            iteration,
+            elapsed_seconds,
+            loss,
+            epsilon,
+            mean_reward,
+            mean_return,
+        ])
+
+
+def format_duration(seconds):
+    """Format a duration compactly for live training progress."""
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {seconds:02d}s"
+    if minutes:
+        return f"{minutes}m {seconds:02d}s"
+    return f"{seconds}s"
 
 
 def build_qvalue_selector():
@@ -189,6 +218,7 @@ def masked_mean(value, mask):
 
 
 def train(args):
+    training_started_at = time.monotonic()
     device = "cuda" if (args.cuda and torch.cuda.is_available()) else "cpu"
     n_players, min_n_players, max_n_players, model_n_players = resolve_player_config(args)
 
@@ -202,8 +232,11 @@ def train(args):
         else f"n_players=[{min_n_players}, {max_n_players}]"
     )
     model_msg = "encoder+DQN" if args.use_encoder else "MLP+DQN"
-    print(f"device={device}  {player_msg}  model={model_msg}  total_frames={total_frames}")
-    print(f"cli_args={json.dumps(vars(args), sort_keys=True)}")
+    print(
+        f"device={device}  {player_msg}  model={model_msg}  total_frames={total_frames}",
+        flush=True,
+    )
+    print(f"cli_args={json.dumps(vars(args), sort_keys=True)}", flush=True)
 
     # environment  
     env = make_torchrl_env(
@@ -317,16 +350,27 @@ def train(args):
         finished = ep_ret[done & active_next]
         eps_now = explore.eps.item() if hasattr(explore.eps, "item") else float(explore.eps)
         mean_return = finished.float().mean().item() if finished.numel() > 0 else ""
-        
-        msg = (f"iter {it:3d} | loss={last_loss:.4f} | eps={eps_now:.3f} "
-               f"| mean turn reward={mean_r:+.3f}")
+
+        completed_iterations = it + 1
+        elapsed_seconds = time.monotonic() - training_started_at
+        progress = min(completed_iterations / args.iterations, 1.0)
+        remaining_iterations = max(args.iterations - completed_iterations, 0)
+        eta_seconds = elapsed_seconds * remaining_iterations / completed_iterations
+        msg = (
+            f"iter {completed_iterations}/{args.iterations} ({progress:6.2%}) "
+            f"| elapsed={format_duration(elapsed_seconds)} "
+            f"| eta={format_duration(eta_seconds)} "
+            f"| loss={last_loss:.4f} | eps={eps_now:.3f} "
+            f"| mean turn reward={mean_r:+.3f}"
+        )
         if mean_return != "":
             msg += f" | mean episode return/seat={mean_return:+.2f}"
-        print(msg)
+        print(msg, flush=True)
 
         log_progress_to_csv(
             filepath=args.log_path,
             iteration=it,
+            elapsed_seconds=elapsed_seconds,
             loss=last_loss,
             epsilon=eps_now,
             mean_reward=mean_r,
@@ -335,7 +379,7 @@ def train(args):
 
     if not args.smoke:
         torch.save(qvalue_actor.state_dict(), args.save_path)
-        print(f"saved Q-network -> {args.save_path}")
+        print(f"saved Q-network -> {args.save_path}", flush=True)
     collector.shutdown()
 
 
