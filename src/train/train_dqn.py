@@ -70,9 +70,6 @@ warnings.filterwarnings("ignore")
 ACTION_VALUE_KEY = (GROUP, "action_value")          # the 12 Q-values
 CHOSEN_VALUE_KEY = (GROUP, "chosen_action_value")   # Q of the action actually taken
 
-NUM_WORKERS = 4
-
-
 def log_progress_to_csv(filepath, iteration, loss, epsilon, mean_reward, mean_return):
     """Append one training-metrics row, creating the CSV header when needed."""
     file_exists = os.path.isfile(filepath)
@@ -276,7 +273,7 @@ def train(args):
         )
 
     collector = MultiSyncDataCollector(
-        create_env_fn=[env_factory] * NUM_WORKERS,
+        create_env_fn=[env_factory] * args.num_workers,
         policy=collector_policy,
         frames_per_batch=args.frames_per_batch,   # split across workers automatically
         total_frames=total_frames,
@@ -352,6 +349,7 @@ def get_args():
     p.add_argument("--buffer-size", type=int, default=100_000)
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--updates-per-batch", type=int, default=16)
+    p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--lr", type=float, default=2.5e-4)
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--target-eps", type=float, default=0.995)  # SoftUpdate mix factor
@@ -379,7 +377,10 @@ def get_args():
     p.add_argument("--encoder-q-cells", type=int, default=128)
     p.add_argument("--encoder-q-depth", type=int, default=1)
     p.add_argument("--save-path", type=str, default="sushi_go_qnet_2_players.pt")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.num_workers < 1:
+        p.error("--num-workers must be at least 1")
+    return args
 
 
 if __name__ == "__main__":
