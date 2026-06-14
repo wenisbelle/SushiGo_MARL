@@ -233,14 +233,31 @@ class SushiGoParallelEnv(ParallelEnv):
 
     # core lifecycle
     def reset(self, seed=None, options=None):
-        """Start a new game, sampling the active player count for this episode."""
+        """Start a new game, optionally forcing the active player count.
+
+        ``options={"n_players": 2}`` is useful for evaluation: a variable model
+        can retain its four-slot observation shapes while playing a two-player
+        game. Without that option, the active count is sampled as usual.
+        """
         if seed is not None:
             self.rng = np.random.default_rng(seed)
 
         self.agents = list(self.possible_agents)
         # Active seats are always the dense prefix player_0..player_{n-1}. Keeping
         # stable slot identity avoids remapping observations/actions between turns.
-        self.active_n_players = int(self.rng.integers(self.min_n_players, self.max_n_players + 1))
+        forced_n_players = None if options is None else options.get("n_players")
+        if forced_n_players is None:
+            active_n_players = int(
+                self.rng.integers(self.min_n_players, self.max_n_players + 1)
+            )
+        else:
+            active_n_players = int(forced_n_players)
+            if not self.min_n_players <= active_n_players <= self.max_n_players:
+                raise ValueError(
+                    "options['n_players'] must be within the environment's "
+                    "configured player-count bounds"
+                )
+        self.active_n_players = active_n_players
         self.n_players = self.active_n_players
         self.hand_size = hand_size_for(self.active_n_players)
         self.player_mask = np.arange(self.max_n_players) < self.active_n_players

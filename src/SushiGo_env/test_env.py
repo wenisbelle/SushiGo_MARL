@@ -98,6 +98,23 @@ def test_stochastic_player_count_reset():
     print("stochastic reset OK        -> sampled counts =", sorted(seen_counts))
 
 
+def test_reset_can_force_active_count_without_changing_dense_shapes():
+    e = SushiGoParallelEnv(n_players=None, min_n_players=2, max_n_players=4)
+    obs, _ = e.reset(options={"n_players": 2})
+    assert e.active_n_players == 2
+    assert len(e.possible_agents) == 4
+    assert e.player_mask.tolist() == [True, True, False, False]
+    assert obs["player_0"]["hand_history"].shape == (3, N_TYPES)
+    assert obs["player_2"]["player_mask"] == np.bool_(False)
+
+    try:
+        e.reset(options={"n_players": 5})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("out-of-range forced player count should fail")
+
+
 def test_hand_history_memory():
     """history slot 0 must equal the hand the player held on the previous turn."""
     e = SushiGoParallelEnv(n_players=3)
