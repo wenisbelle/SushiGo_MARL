@@ -37,11 +37,12 @@ import json
 import warnings
 import sys 
 import os
+import csv
 
 import torch
 from torch import nn
 from tensordict.nn import TensorDictModule, TensorDictSequential
-from torchrl.collectors import SyncDataCollector, MultiSyncDataCollector
+from torchrl.collectors import MultiSyncDataCollector
 from torchrl.data import TensorDictReplayBuffer
 from torchrl.data.replay_buffers import LazyTensorStorage
 from torchrl.envs import check_env_specs
@@ -69,7 +70,23 @@ warnings.filterwarnings("ignore")
 ACTION_VALUE_KEY = (GROUP, "action_value")          # the 12 Q-values
 CHOSEN_VALUE_KEY = (GROUP, "chosen_action_value")   # Q of the action actually taken
 
-NUM_WORKERS = 4 
+NUM_WORKERS = 4
+
+
+def log_progress_to_csv(filepath, iteration, loss, epsilon, mean_reward, mean_return):
+    """Append one training-metrics row, creating the CSV header when needed."""
+    file_exists = os.path.isfile(filepath)
+    with open(filepath, mode="a", newline="") as file:
+        writer = csv.writer(file)
+        if not file_exists:
+            writer.writerow([
+                "iteration",
+                "loss",
+                "epsilon",
+                "mean_turn_reward",
+                "mean_episode_return",
+            ])
+        writer.writerow([iteration, loss, epsilon, mean_reward, mean_return])
 
 
 def build_qvalue_selector():
@@ -302,11 +319,22 @@ def train(args):
         ep_ret = batch.get(("next", GROUP, "episode_reward")).squeeze(-1)
         finished = ep_ret[done & active_next]
         eps_now = explore.eps.item() if hasattr(explore.eps, "item") else float(explore.eps)
+        mean_return = finished.float().mean().item() if finished.numel() > 0 else ""
+        
         msg = (f"iter {it:3d} | loss={last_loss:.4f} | eps={eps_now:.3f} "
                f"| mean turn reward={mean_r:+.3f}")
-        if finished.numel() > 0:
-            msg += f" | mean episode return/seat={finished.float().mean().item():+.2f}"
+        if mean_return != "":
+            msg += f" | mean episode return/seat={mean_return:+.2f}"
         print(msg)
+
+        log_progress_to_csv(
+            filepath=args.log_path,
+            iteration=it,
+            loss=last_loss,
+            epsilon=eps_now,
+            mean_reward=mean_r,
+            mean_return=mean_return
+        )
 
     if not args.smoke:
         torch.save(qvalue_actor.state_dict(), args.save_path)
@@ -332,6 +360,7 @@ def get_args():
     p.add_argument("--cuda", action="store_true")
     p.add_argument("--compile", action="store_true", help="torch.compile the Q-network for faster training")
     p.add_argument("--smoke", action="store_true", help="tiny wiring-check run")
+    p.add_argument("--log-path", type=str, default="training_log.csv")
     p.add_argument("--use-encoder", action="store_true", help="use transformer encoder before the DQN Q-head")
     p.add_argument("--mlp-cells", type=int, default=128)
     p.add_argument("--mlp-depth", type=int, default=2)
