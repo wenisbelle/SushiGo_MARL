@@ -1,13 +1,13 @@
 {
   "command": [
-    "/usr/bin/python3",
-    "/SushiGo/src/train/train_dqn.py",
+    "/home/thlamz/SushiGo_MARL/.venv/bin/python3",
+    "/home/thlamz/SushiGo_MARL/src/train/train_dqn.py",
     "--n-players",
     "3",
     "--iterations",
     "5000",
     "--frames-per-batch",
-    "5000",
+    "200",
     "--buffer-size",
     "100000",
     "--batch-size",
@@ -15,7 +15,7 @@
     "--updates-per-batch",
     "8",
     "--num-workers",
-    "12",
+    "4",
     "--lr",
     "0.00025",
     "--gamma",
@@ -31,29 +31,29 @@
     "--mlp-depth",
     "3",
     "--save-path",
-    "/SushiGo/results/league/fixed_3p/repetition_2/model.pt",
+    "/home/thlamz/SushiGo_MARL/results/league/fixed_3p/repetition_2/model.pt",
     "--log-path",
-    "/SushiGo/results/league/fixed_3p/repetition_2/metrics.csv"
+    "/home/thlamz/SushiGo_MARL/results/league/fixed_3p/repetition_2/metrics.csv"
   ],
   "cuda_requested": false,
   "git": {
-    "commit": null,
-    "dirty": null
+    "commit": "46624db1f18b8346605286f5f629e3feff67d9bb",
+    "dirty": true
   },
-  "launched_at": "2026-06-15T06:31:39.991831+00:00",
+  "launched_at": "2026-06-15T14:05:21.867385+00:00",
   "packages": {
-    "numpy": "2.2.6",
-    "tensordict": "0.13.0",
-    "torch": "2.12.0",
-    "torchrl": "0.13.1"
+    "numpy": "2.4.6",
+    "tensordict": "0.12.4",
+    "torch": "2.11.0+cu128",
+    "torchrl": "0.12.0"
   },
   "preset": "fixed_3p",
-  "python": "3.10.12 (main, Nov  4 2025, 08:48:33) [GCC 11.4.0]",
+  "python": "3.13.13 (main, Apr  7 2026, 20:49:46) [Clang 22.1.1 ]",
   "repetition": 2,
   "training_args": {
     "batch_size": 256,
     "buffer_size": 100000,
-    "frames_per_batch": 5000,
+    "frames_per_batch": 200,
     "gamma": 0.99,
     "iterations": 5000,
     "lr": 0.00025,
@@ -61,7 +61,7 @@
     "mlp_cells": 128,
     "mlp_depth": 3,
     "n_players": 3,
-    "num_workers": 12,
+    "num_workers": 4,
     "reward_scale": 0.1,
     "target_eps": 0.995,
     "updates_per_batch": 8
