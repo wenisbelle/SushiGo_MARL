@@ -33,11 +33,13 @@ class LeaguePreset:
         return {
             **dict(self.args),
             "iterations": 5_000,
-            "frames_per_batch": 5_000,
+            # Keep 40k optimizer steps, but collect less stale-policy data between
+            # updates. This cuts each run from 25M to 1M environment frames.
+            "frames_per_batch": 200,
             "buffer_size": 100_000,
             "batch_size": 256,
             "updates_per_batch": 8,
-            "num_workers": 12,
+            "num_workers": 4,
             "lr": 2.5e-4,
             "gamma": 0.99,
             "target_eps": 0.995,
