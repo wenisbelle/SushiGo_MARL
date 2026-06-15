@@ -383,7 +383,12 @@ def train(args):
     collector.shutdown()
 
 
-def get_args():
+def build_arg_parser():
+    """Build the authoritative training CLI parser.
+
+    League evaluation reuses these defaults when reconstructing a checkpoint,
+    so encoder architecture defaults stay defined in one place.
+    """
     p = argparse.ArgumentParser()
     p.add_argument("--n-players", type=int, default=None, choices=[2, 3, 4])
     p.add_argument("--min-n-players", type=int, default=None, choices=[2, 3, 4])
@@ -421,7 +426,12 @@ def get_args():
     p.add_argument("--encoder-q-cells", type=int, default=128)
     p.add_argument("--encoder-q-depth", type=int, default=1)
     p.add_argument("--save-path", type=str, default="sushi_go_qnet_2_players.pt")
-    args = p.parse_args()
+    return p
+
+
+def get_args(argv=None):
+    p = build_arg_parser()
+    args = p.parse_args(argv)
     if args.num_workers < 1:
         p.error("--num-workers must be at least 1")
     return args

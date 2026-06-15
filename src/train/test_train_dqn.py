@@ -1,12 +1,19 @@
 import csv
 
-from train.train_dqn import format_duration, log_progress_to_csv
+from train.train_dqn import build_arg_parser, format_duration, log_progress_to_csv
 
 
 def test_format_duration():
     assert format_duration(9.8) == "9s"
     assert format_duration(125) == "2m 05s"
     assert format_duration(3_726) == "1h 02m 06s"
+
+
+def test_model_defaults_are_available_without_parsing_process_arguments():
+    args = build_arg_parser().parse_args([])
+    assert args.mlp_cells == 128
+    assert args.encoder_sequential_embed_dim == 64
+    assert args.encoder_q_depth == 1
 
 
 def test_log_progress_includes_relative_time(tmp_path):
