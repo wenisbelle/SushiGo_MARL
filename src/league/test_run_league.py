@@ -9,6 +9,7 @@ from SushiGo_env.sushi_go_env import SushiGoParallelEnv
 from SushiGo_env.torchrl_integration import GROUP
 from league.policies import (
     CheckpointSpec,
+    RANDOM_PRESET,
     checkpoint_matchups,
     checkpoint_pairs,
     discover_checkpoints,
@@ -44,6 +45,7 @@ def test_discovery_includes_only_completed_eligible_checkpoints(tmp_path):
     assert [spec.label for spec in specs] == [
         "fixed_2p/repetition_1",
         "fixed_2p/repetition_2",
+        "random/repetition_1",
     ]
 
 
@@ -52,6 +54,13 @@ def test_completed_checkpoint_requires_config_and_model(tmp_path):
     (run_dir / "model.pt").unlink()
     with pytest.raises(RuntimeError, match="model.pt"):
         discover_checkpoints(tmp_path)
+
+
+def test_random_baseline_is_discovered_without_checkpoint_files(tmp_path):
+    specs = discover_checkpoints(tmp_path, [RANDOM_PRESET])
+    assert len(specs) == 1
+    assert specs[0].competitor == RANDOM_PRESET
+    assert specs[0].repetition == 1
 
 
 def test_checkpoint_pairs_include_cross_repetitions_without_self_pairs(tmp_path):
@@ -90,6 +99,19 @@ def test_three_player_matchups_allow_two_but_not_three_of_same_model(tmp_path):
     assert any(
         sum(spec.competitor == "fixed_3p" for spec in matchup) == 2
         for matchup in matchups
+    )
+
+
+def test_default_three_player_matchups_include_random_baseline(tmp_path):
+    for competitor in ("fixed_3p", "variable_2_4", "variable_encoder_2_4"):
+        make_checkpoint(tmp_path, competitor, 1)
+    specs = discover_checkpoints(
+        tmp_path, ["fixed_3p", "variable_2_4", "variable_encoder_2_4", RANDOM_PRESET]
+    )
+    assert any(spec.competitor == RANDOM_PRESET for spec in specs)
+    assert any(
+        RANDOM_PRESET in {spec.competitor for spec in matchup}
+        for matchup in checkpoint_matchups(specs, 3)
     )
 
 
@@ -198,6 +220,19 @@ def test_play_game_uses_randomized_seat_assignment(tmp_path):
     assert len(points) == len(puddings) == len(game_outcomes) == 2
 
 
+def test_random_policy_samples_only_legal_actions():
+    spec = discover_checkpoints(Path("unused"), [RANDOM_PRESET])[0]
+    policy = load_policy(spec)
+    observations = {
+        "player_0": {
+            "action_mask": np.array([False, True, False, True] + [False] * 8)
+        }
+    }
+
+    for _ in range(20):
+        assert policy.action(observations, seat=0) in {1, 3}
+
+
 def test_run_league_writes_two_rows_per_game(tmp_path, monkeypatch):
     class Policy:
         def __init__(self, competitor):
@@ -246,7 +281,7 @@ SAMPLE_MODELS_AVAILABLE = all(
 def test_loads_and_runs_all_current_eligible_sample_checkpoints():
     specs = discover_checkpoints(SAMPLE_ROOT)
     assert {spec.competitor for spec in specs} == {
-        "fixed_2p", "variable_2_4", "variable_encoder_2_4"
+        "fixed_2p", "variable_2_4", "variable_encoder_2_4", RANDOM_PRESET
     }
     env = SushiGoParallelEnv(
         n_players=None, min_n_players=2, max_n_players=4

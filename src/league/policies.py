@@ -31,15 +31,17 @@ from SushiGo_env.torchrl_integration import (
 from train.train_dqn import build_arg_parser, build_qvalue_actor, resolve_player_config
 
 
+RANDOM_PRESET = "random"
 ELIGIBLE_2P_PRESETS = (
     "fixed_2p",
     "variable_2_4",
     "variable_encoder_2_4",
+    RANDOM_PRESET,
 )
 ELIGIBLE_PRESETS_BY_PLAYERS = {
     2: ELIGIBLE_2P_PRESETS,
-    3: ("fixed_3p", "variable_2_4", "variable_encoder_2_4"),
-    4: ("fixed_4p", "variable_2_4", "variable_encoder_2_4"),
+    3: ("fixed_3p", "variable_2_4", "variable_encoder_2_4", RANDOM_PRESET),
+    4: ("fixed_4p", "variable_2_4", "variable_encoder_2_4", RANDOM_PRESET),
 }
 
 
@@ -70,7 +72,7 @@ def discover_checkpoints(
     known = set().union(*ELIGIBLE_PRESETS_BY_PLAYERS.values())
     unknown = requested.difference(known)
     if unknown:
-        raise ValueError(f"Unknown two-player competitors: {', '.join(sorted(unknown))}")
+        raise ValueError(f"Unknown league competitors: {', '.join(sorted(unknown))}")
 
     checkpoints: list[CheckpointSpec] = []
     preset_order = {
@@ -83,6 +85,17 @@ def discover_checkpoints(
     }
     for competitor in preset_order:
         if competitor not in requested:
+            continue
+        if competitor == RANDOM_PRESET:
+            checkpoints.append(
+                CheckpointSpec(
+                    competitor=RANDOM_PRESET,
+                    repetition=1,
+                    run_dir=Path(RANDOM_PRESET),
+                    checkpoint_path=Path(RANDOM_PRESET),
+                    training_args={"policy": RANDOM_PRESET},
+                )
+            )
             continue
         preset_dir = models_root / competitor
         if not preset_dir.is_dir():
@@ -220,8 +233,22 @@ class LoadedPolicy:
         return int(td.get(ACTION_KEY)[seat].item())
 
 
+class RandomPolicy:
+    """Baseline policy that samples uniformly from legal actions."""
+
+    def __init__(self, spec: CheckpointSpec):
+        self.spec = spec
+
+    def action(self, observations, seat: int) -> int:
+        legal_actions = np.flatnonzero(observations[f"player_{seat}"]["action_mask"])
+        return int(np.random.choice(legal_actions))
+
+
 def load_policy(spec: CheckpointSpec, device: str = "cpu") -> LoadedPolicy:
     """Rebuild and strictly validate one actor from its recorded configuration."""
+    if spec.competitor == RANDOM_PRESET:
+        return RandomPolicy(spec)
+
     resolved = training_defaults()
     resolved.update(spec.training_args)
     args = Namespace(**resolved)
