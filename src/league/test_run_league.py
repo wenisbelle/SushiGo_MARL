@@ -9,6 +9,7 @@ from SushiGo_env.sushi_go_env import SushiGoParallelEnv
 from SushiGo_env.torchrl_integration import GROUP
 from league.policies import (
     CheckpointSpec,
+    DEEP_CFR_PRESET,
     RANDOM_PRESET,
     checkpoint_matchups,
     checkpoint_pairs,
@@ -293,9 +294,12 @@ SAMPLE_MODELS_AVAILABLE = all(
 @pytest.mark.skipif(not SAMPLE_MODELS_AVAILABLE, reason="sample league models unavailable")
 def test_loads_and_runs_all_current_eligible_sample_checkpoints():
     specs = discover_checkpoints(SAMPLE_ROOT)
-    assert {spec.competitor for spec in specs} == {
+    expected = {
         "fixed_2p", "variable_2_4", "variable_encoder_2_4", RANDOM_PRESET
     }
+    if (SAMPLE_ROOT / DEEP_CFR_PRESET / "model.pt").is_file():
+        expected.add(DEEP_CFR_PRESET)
+    assert {spec.competitor for spec in specs} == expected
     env = SushiGoParallelEnv(
         n_players=None, min_n_players=2, max_n_players=4
     )

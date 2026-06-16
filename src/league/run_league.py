@@ -27,7 +27,7 @@ from league.policies import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_MODELS_ROOT = REPO_ROOT / "results" / "2p_league"
+DEFAULT_MODELS_ROOT = REPO_ROOT / "results" / "league"
 CSV_FIELDS = (
     "match_id",
     "matchup_id",
@@ -213,7 +213,7 @@ def main(argv=None) -> int:
     output_dir = (
         args.output_dir
         if args.output_dir is not None
-        else REPO_ROOT / "results" / "2p_league_results" / f"{args.players}p"
+        else REPO_ROOT / "results" / "league_results" / f"{args.players}p"
     )
     competitors = (
         args.competitors
