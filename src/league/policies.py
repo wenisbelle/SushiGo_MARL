@@ -12,7 +12,9 @@ from typing import Mapping, Sequence
 
 import numpy as np
 import torch
+from torch import nn
 from tensordict import TensorDict
+
 
 
 SRC_ROOT = Path(__file__).resolve().parents[1]
@@ -30,13 +32,32 @@ from SushiGo_env.torchrl_integration import (
 )
 from train.train_dqn import build_arg_parser, build_qvalue_actor, resolve_player_config
 
+##### FOr the Deep CFR model
+class MLP(nn.Module):
+	def __init__(self, input_dim: int, output_dim: int, hidden_dim: int, depth: int):
+		super().__init__()
+		layers = []
+		last_dim = input_dim
+		for _ in range(depth):
+			layers.append(nn.Linear(last_dim, hidden_dim))
+			layers.append(nn.Tanh())
+			last_dim = hidden_dim
+		layers.append(nn.Linear(last_dim, output_dim))
+		self.net = nn.Sequential(*layers)
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		return self.net(x)
+
 
 RANDOM_PRESET = "random"
+DEEP_CFR_PRESET = "deep_cfr_2p"
+
 ELIGIBLE_2P_PRESETS = (
     "fixed_2p",
     "variable_2_4",
     "variable_encoder_2_4",
     RANDOM_PRESET,
+    DEEP_CFR_PRESET
 )
 ELIGIBLE_PRESETS_BY_PLAYERS = {
     2: ELIGIBLE_2P_PRESETS,
@@ -67,7 +88,7 @@ def discover_checkpoints(
     models_root: Path,
     competitors: Sequence[str] = ELIGIBLE_2P_PRESETS,
 ) -> list[CheckpointSpec]:
-    """Discover first completed repetition for each eligible competitor."""
+    """Discover completed, eligible checkpoint repetitions in stable order."""
     requested = set(competitors)
     known = set().union(*ELIGIBLE_PRESETS_BY_PLAYERS.values())
     unknown = requested.difference(known)
@@ -97,48 +118,74 @@ def discover_checkpoints(
                 )
             )
             continue
+
+        if competitor == DEEP_CFR_PRESET:
+            preset_dir = models_root / competitor
+            if not preset_dir.is_dir():
+                continue
+            checkpoint_path = preset_dir / "model.pt"
+            if not checkpoint_path.is_file():
+                raise RuntimeError(
+                    f"Deep CFR preset directory exists at {preset_dir} "
+                    f"but model.pt is missing."
+                )
+            checkpoints.append(
+                CheckpointSpec(
+                    competitor=DEEP_CFR_PRESET,
+                    repetition=1,
+                    run_dir=preset_dir,
+                    checkpoint_path=checkpoint_path,
+                    training_args={},  # not used; DeepCFRPolicy handles its own loading
+                )
+            )
+            continue
+
         preset_dir = models_root / competitor
         if not preset_dir.is_dir():
             continue
-        run_dir = preset_dir / "repetition_1"
-        if not (run_dir / "COMPLETE").is_file():
-            continue
-        config_path = run_dir / "config.json"
-        checkpoint_path = run_dir / "model.pt"
-        missing = [
-            path.name
-            for path in (config_path, checkpoint_path)
-            if not path.is_file()
-        ]
-        if missing:
-            raise RuntimeError(
-                f"Completed run {run_dir} is missing required artifacts: "
-                f"{', '.join(missing)}"
+        for run_dir in preset_dir.glob("repetition_*"):
+            if not (run_dir / "COMPLETE").is_file():
+                continue
+            config_path = run_dir / "config.json"
+            checkpoint_path = run_dir / "model.pt"
+            missing = [
+                path.name
+                for path in (config_path, checkpoint_path)
+                if not path.is_file()
+            ]
+            if missing:
+                raise RuntimeError(
+                    f"Completed run {run_dir} is missing required artifacts: "
+                    f"{', '.join(missing)}"
+                )
+            try:
+                repetition = int(run_dir.name.removeprefix("repetition_"))
+            except ValueError as error:
+                raise RuntimeError(f"Invalid repetition directory: {run_dir}") from error
+
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            if config.get("preset") != competitor:
+                raise RuntimeError(
+                    f"Preset mismatch in {config_path}: expected {competitor!r}, "
+                    f"got {config.get('preset')!r}"
+                )
+            if config.get("repetition") not in (None, repetition):
+                raise RuntimeError(
+                    f"Repetition mismatch in {config_path}: expected {repetition}, "
+                    f"got {config.get('repetition')!r}"
+                )
+            training_args = config.get("training_args")
+            if not isinstance(training_args, dict):
+                raise RuntimeError(f"Missing training_args object in {config_path}")
+            checkpoints.append(
+                CheckpointSpec(
+                    competitor=competitor,
+                    repetition=repetition,
+                    run_dir=run_dir,
+                    checkpoint_path=checkpoint_path,
+                    training_args=training_args,
+                )
             )
-        repetition = 1
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-        if config.get("preset") != competitor:
-            raise RuntimeError(
-                f"Preset mismatch in {config_path}: expected {competitor!r}, "
-                f"got {config.get('preset')!r}"
-            )
-        if config.get("repetition") not in (None, repetition):
-            raise RuntimeError(
-                f"Repetition mismatch in {config_path}: expected {repetition}, "
-                f"got {config.get('repetition')!r}"
-            )
-        training_args = config.get("training_args")
-        if not isinstance(training_args, dict):
-            raise RuntimeError(f"Missing training_args object in {config_path}")
-        checkpoints.append(
-            CheckpointSpec(
-                competitor=competitor,
-                repetition=repetition,
-                run_dir=run_dir,
-                checkpoint_path=checkpoint_path,
-                training_args=training_args,
-            )
-        )
     return sorted(
         checkpoints,
         key=lambda spec: (preset_order[spec.competitor], spec.repetition),
@@ -149,11 +196,11 @@ def checkpoint_matchups(
     checkpoints: Sequence[CheckpointSpec],
     table_size: int,
 ) -> list[tuple[CheckpointSpec, ...]]:
-    """Return unordered tables with no repeated model family."""
+    """Return unordered distinct-checkpoint tables, excluding all-same models."""
     return [
         matchup
         for matchup in combinations(checkpoints, table_size)
-        if len({spec.competitor for spec in matchup}) == table_size
+        if table_size == 2 or len({spec.competitor for spec in matchup}) > 1
     ]
 
 
@@ -210,6 +257,13 @@ def observations_to_tensordict(
     )
     return td
 
+def flatten_obs(obs_dict: Mapping[str, np.ndarray]) -> np.ndarray:
+    """Flatten a structured per-agent observation into a single vector.
+ 
+    Replicates SushiGoParallelEnv.flatten_observation() using OBS_COMPONENTS
+    so DeepCFRPolicy does not need a reference to the environment.
+    """
+    return np.concatenate([obs_dict[k].ravel() for k in OBS_COMPONENTS])
 
 class LoadedPolicy:
     """A validated checkpoint plus its native observation/inference contract."""
@@ -238,12 +292,41 @@ class RandomPolicy:
     def action(self, observations, seat: int) -> int:
         legal_actions = np.flatnonzero(observations[f"player_{seat}"]["action_mask"])
         return int(np.random.choice(legal_actions))
+    
+class DeepCFRPolicy:
+    """Average-policy MLP from Deep CFR, using greedy masked argmax at inference.
+    """
+ 
+    def __init__(self, spec: CheckpointSpec, net: MLP, device: torch.device):
+        self.spec = spec
+        self.net = net
+        self.device = device
+ 
+    def action(self, observations, seat: int) -> int:
+        obs_dict = dict(observations[f"player_{seat}"])
+        obs_dict["hand_history"] = obs_dict["hand_history"][:1]
+        obs_dict["opponent_tableaus"] = obs_dict["opponent_tableaus"][:1]
+        obs_flat = flatten_obs(obs_dict)
+        mask = obs_dict["action_mask"].astype(bool)
+ 
+        obs_t = torch.as_tensor(obs_flat, dtype=torch.float32, device=self.device).unsqueeze(0)
+        mask_t = torch.as_tensor(mask, dtype=torch.bool, device=self.device).unsqueeze(0)
+ 
+        with torch.inference_mode():
+            logits = self.net(obs_t)
+            masked_logits = logits.masked_fill(~mask_t, -1e9)
+            action = int(torch.argmax(masked_logits, dim=-1).item())
+ 
+        return action
 
 
 def load_policy(spec: CheckpointSpec, device: str = "cpu") -> LoadedPolicy:
     """Rebuild and strictly validate one actor from its recorded configuration."""
     if spec.competitor == RANDOM_PRESET:
         return RandomPolicy(spec)
+    
+    if spec.competitor == DEEP_CFR_PRESET:
+        return _load_deep_cfr_policy(spec, device)
 
     resolved = training_defaults()
     resolved.update(spec.training_args)
@@ -278,3 +361,43 @@ def load_policy(spec: CheckpointSpec, device: str = "cpu") -> LoadedPolicy:
     finally:
         env.close()
     return LoadedPolicy(spec, actor, model_n_players, device)
+
+def _load_deep_cfr_policy(spec: CheckpointSpec, device: str) -> DeepCFRPolicy:
+    """Load the Deep CFR average-policy MLP from its checkpoint dict."""
+    N_TYPES = 12
+    try:
+        checkpoint = torch.load(
+            spec.checkpoint_path,
+            map_location=device,
+            weights_only=True,
+        )
+    except Exception as error:
+        raise RuntimeError(
+            f"Could not load Deep CFR checkpoint {spec.label}: {error}"
+        ) from error
+
+    if not isinstance(checkpoint, dict):
+        raise RuntimeError(
+            f"Deep CFR checkpoint {spec.checkpoint_path} must be a dict, "
+            f"got {type(checkpoint).__name__}"
+        )
+
+    required_keys = {"model_state_dict", "obs_dim", "hidden_dim", "depth"}
+    missing = required_keys - checkpoint.keys()
+    if missing:
+        raise RuntimeError(
+            f"Deep CFR checkpoint {spec.checkpoint_path} is missing keys: "
+            f"{', '.join(sorted(missing))}"
+        )
+
+    net = MLP(
+        input_dim=int(checkpoint["obs_dim"]),
+        output_dim=N_TYPES,
+        hidden_dim=int(checkpoint["hidden_dim"]),
+        depth=int(checkpoint["depth"]),
+    )
+    net.load_state_dict(checkpoint["model_state_dict"])
+    net.to(device)
+    net.eval()
+
+    return DeepCFRPolicy(spec, net, torch.device(device))
