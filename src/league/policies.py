@@ -67,7 +67,7 @@ def discover_checkpoints(
     models_root: Path,
     competitors: Sequence[str] = ELIGIBLE_2P_PRESETS,
 ) -> list[CheckpointSpec]:
-    """Discover completed, eligible checkpoint repetitions in stable order."""
+    """Discover first completed repetition for each eligible competitor."""
     requested = set(competitors)
     known = set().union(*ELIGIBLE_PRESETS_BY_PLAYERS.values())
     unknown = requested.difference(known)
@@ -100,49 +100,45 @@ def discover_checkpoints(
         preset_dir = models_root / competitor
         if not preset_dir.is_dir():
             continue
-        for run_dir in preset_dir.glob("repetition_*"):
-            if not (run_dir / "COMPLETE").is_file():
-                continue
-            config_path = run_dir / "config.json"
-            checkpoint_path = run_dir / "model.pt"
-            missing = [
-                path.name
-                for path in (config_path, checkpoint_path)
-                if not path.is_file()
-            ]
-            if missing:
-                raise RuntimeError(
-                    f"Completed run {run_dir} is missing required artifacts: "
-                    f"{', '.join(missing)}"
-                )
-            try:
-                repetition = int(run_dir.name.removeprefix("repetition_"))
-            except ValueError as error:
-                raise RuntimeError(f"Invalid repetition directory: {run_dir}") from error
-
-            config = json.loads(config_path.read_text(encoding="utf-8"))
-            if config.get("preset") != competitor:
-                raise RuntimeError(
-                    f"Preset mismatch in {config_path}: expected {competitor!r}, "
-                    f"got {config.get('preset')!r}"
-                )
-            if config.get("repetition") not in (None, repetition):
-                raise RuntimeError(
-                    f"Repetition mismatch in {config_path}: expected {repetition}, "
-                    f"got {config.get('repetition')!r}"
-                )
-            training_args = config.get("training_args")
-            if not isinstance(training_args, dict):
-                raise RuntimeError(f"Missing training_args object in {config_path}")
-            checkpoints.append(
-                CheckpointSpec(
-                    competitor=competitor,
-                    repetition=repetition,
-                    run_dir=run_dir,
-                    checkpoint_path=checkpoint_path,
-                    training_args=training_args,
-                )
+        run_dir = preset_dir / "repetition_1"
+        if not (run_dir / "COMPLETE").is_file():
+            continue
+        config_path = run_dir / "config.json"
+        checkpoint_path = run_dir / "model.pt"
+        missing = [
+            path.name
+            for path in (config_path, checkpoint_path)
+            if not path.is_file()
+        ]
+        if missing:
+            raise RuntimeError(
+                f"Completed run {run_dir} is missing required artifacts: "
+                f"{', '.join(missing)}"
             )
+        repetition = 1
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        if config.get("preset") != competitor:
+            raise RuntimeError(
+                f"Preset mismatch in {config_path}: expected {competitor!r}, "
+                f"got {config.get('preset')!r}"
+            )
+        if config.get("repetition") not in (None, repetition):
+            raise RuntimeError(
+                f"Repetition mismatch in {config_path}: expected {repetition}, "
+                f"got {config.get('repetition')!r}"
+            )
+        training_args = config.get("training_args")
+        if not isinstance(training_args, dict):
+            raise RuntimeError(f"Missing training_args object in {config_path}")
+        checkpoints.append(
+            CheckpointSpec(
+                competitor=competitor,
+                repetition=repetition,
+                run_dir=run_dir,
+                checkpoint_path=checkpoint_path,
+                training_args=training_args,
+            )
+        )
     return sorted(
         checkpoints,
         key=lambda spec: (preset_order[spec.competitor], spec.repetition),
@@ -153,11 +149,11 @@ def checkpoint_matchups(
     checkpoints: Sequence[CheckpointSpec],
     table_size: int,
 ) -> list[tuple[CheckpointSpec, ...]]:
-    """Return unordered distinct-checkpoint tables, excluding all-same models."""
+    """Return unordered tables with no repeated model family."""
     return [
         matchup
         for matchup in combinations(checkpoints, table_size)
-        if table_size == 2 or len({spec.competitor for spec in matchup}) > 1
+        if len({spec.competitor for spec in matchup}) == table_size
     ]
 
 

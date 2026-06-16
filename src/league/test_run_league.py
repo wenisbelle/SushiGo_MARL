@@ -44,7 +44,6 @@ def test_discovery_includes_only_completed_eligible_checkpoints(tmp_path):
     specs = discover_checkpoints(tmp_path)
     assert [spec.label for spec in specs] == [
         "fixed_2p/repetition_1",
-        "fixed_2p/repetition_2",
         "random/repetition_1",
     ]
 
@@ -63,7 +62,16 @@ def test_random_baseline_is_discovered_without_checkpoint_files(tmp_path):
     assert specs[0].repetition == 1
 
 
-def test_checkpoint_pairs_include_cross_repetitions_without_self_pairs(tmp_path):
+def test_discovery_uses_only_first_repetition(tmp_path):
+    make_checkpoint(tmp_path, "fixed_2p", 1)
+    make_checkpoint(tmp_path, "fixed_2p", 2)
+    make_checkpoint(tmp_path, "fixed_2p", 3)
+
+    specs = discover_checkpoints(tmp_path, ["fixed_2p"])
+    assert [spec.label for spec in specs] == ["fixed_2p/repetition_1"]
+
+
+def test_checkpoint_pairs_exclude_repeated_model_families(tmp_path):
     specs = []
     for competitor, repetition in (
         ("fixed_2p", 1),
@@ -75,29 +83,34 @@ def test_checkpoint_pairs_include_cross_repetitions_without_self_pairs(tmp_path)
             competitor, repetition, run_dir, run_dir / "model.pt", {}
         ))
     pairs = checkpoint_pairs(specs)
-    assert len(pairs) == 3
+    assert len(pairs) == 2
     assert all(left != right for left, right in pairs)
-    assert any(left.competitor == right.competitor for left, right in pairs)
+    assert all(left.competitor != right.competitor for left, right in pairs)
 
 
-def test_three_player_matchups_allow_two_but_not_three_of_same_model(tmp_path):
+def test_three_player_matchups_exclude_repeated_model_families(tmp_path):
     specs = []
     for competitor, repetition in (
         ("fixed_3p", 1),
         ("fixed_3p", 2),
-        ("fixed_3p", 3),
         ("variable_2_4", 1),
+        ("variable_encoder_2_4", 1),
+        (RANDOM_PRESET, 1),
     ):
-        run_dir = make_checkpoint(tmp_path, competitor, repetition)
-        specs.append(CheckpointSpec(
-            competitor, repetition, run_dir, run_dir / "model.pt", {}
-        ))
+        if competitor == RANDOM_PRESET:
+            specs.append(CheckpointSpec(
+                competitor, repetition, Path(competitor), Path(competitor), {}
+            ))
+        else:
+            run_dir = make_checkpoint(tmp_path, competitor, repetition)
+            specs.append(CheckpointSpec(
+                competitor, repetition, run_dir, run_dir / "model.pt", {}
+            ))
 
     matchups = checkpoint_matchups(specs, 3)
-    assert len(matchups) == 3
-    assert all(len({spec.competitor for spec in matchup}) > 1 for matchup in matchups)
-    assert any(
-        sum(spec.competitor == "fixed_3p" for spec in matchup) == 2
+    assert len(matchups) == 7
+    assert all(
+        len({spec.competitor for spec in matchup}) == 3
         for matchup in matchups
     )
 
