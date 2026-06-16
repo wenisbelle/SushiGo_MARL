@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import sys
+from itertools import combinations
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -35,6 +36,11 @@ ELIGIBLE_2P_PRESETS = (
     "variable_2_4",
     "variable_encoder_2_4",
 )
+ELIGIBLE_PRESETS_BY_PLAYERS = {
+    2: ELIGIBLE_2P_PRESETS,
+    3: ("fixed_3p", "variable_2_4", "variable_encoder_2_4"),
+    4: ("fixed_4p", "variable_2_4", "variable_encoder_2_4"),
+}
 
 
 @dataclass(frozen=True)
@@ -61,12 +67,21 @@ def discover_checkpoints(
 ) -> list[CheckpointSpec]:
     """Discover completed, eligible checkpoint repetitions in stable order."""
     requested = set(competitors)
-    unknown = requested.difference(ELIGIBLE_2P_PRESETS)
+    known = set().union(*ELIGIBLE_PRESETS_BY_PLAYERS.values())
+    unknown = requested.difference(known)
     if unknown:
         raise ValueError(f"Unknown two-player competitors: {', '.join(sorted(unknown))}")
 
     checkpoints: list[CheckpointSpec] = []
-    for competitor in ELIGIBLE_2P_PRESETS:
+    preset_order = {
+        name: index
+        for index, name in enumerate(dict.fromkeys(
+            preset
+            for presets in ELIGIBLE_PRESETS_BY_PLAYERS.values()
+            for preset in presets
+        ))
+    }
+    for competitor in preset_order:
         if competitor not in requested:
             continue
         preset_dir = models_root / competitor
@@ -115,20 +130,27 @@ def discover_checkpoints(
                     training_args=training_args,
                 )
             )
-    preset_order = {name: index for index, name in enumerate(ELIGIBLE_2P_PRESETS)}
     return sorted(
         checkpoints,
         key=lambda spec: (preset_order[spec.competitor], spec.repetition),
     )
 
 
-def checkpoint_pairs(checkpoints: Sequence[CheckpointSpec]):
-    """Return every unordered pair, excluding only exact checkpoint self-play."""
+def checkpoint_matchups(
+    checkpoints: Sequence[CheckpointSpec],
+    table_size: int,
+) -> list[tuple[CheckpointSpec, ...]]:
+    """Return unordered distinct-checkpoint tables, excluding all-same models."""
     return [
-        (checkpoints[left], checkpoints[right])
-        for left in range(len(checkpoints))
-        for right in range(left + 1, len(checkpoints))
+        matchup
+        for matchup in combinations(checkpoints, table_size)
+        if table_size == 2 or len({spec.competitor for spec in matchup}) > 1
     ]
+
+
+def checkpoint_pairs(checkpoints: Sequence[CheckpointSpec]):
+    """Backward-compatible two-player matchup helper."""
+    return checkpoint_matchups(checkpoints, 2)
 
 
 def native_observations(

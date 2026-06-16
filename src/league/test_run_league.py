@@ -9,6 +9,7 @@ from SushiGo_env.sushi_go_env import SushiGoParallelEnv
 from SushiGo_env.torchrl_integration import GROUP
 from league.policies import (
     CheckpointSpec,
+    checkpoint_matchups,
     checkpoint_pairs,
     discover_checkpoints,
     load_policy,
@@ -70,10 +71,36 @@ def test_checkpoint_pairs_include_cross_repetitions_without_self_pairs(tmp_path)
     assert any(left.competitor == right.competitor for left, right in pairs)
 
 
+def test_three_player_matchups_allow_two_but_not_three_of_same_model(tmp_path):
+    specs = []
+    for competitor, repetition in (
+        ("fixed_3p", 1),
+        ("fixed_3p", 2),
+        ("fixed_3p", 3),
+        ("variable_2_4", 1),
+    ):
+        run_dir = make_checkpoint(tmp_path, competitor, repetition)
+        specs.append(CheckpointSpec(
+            competitor, repetition, run_dir, run_dir / "model.pt", {}
+        ))
+
+    matchups = checkpoint_matchups(specs, 3)
+    assert len(matchups) == 3
+    assert all(len({spec.competitor for spec in matchup}) > 1 for matchup in matchups)
+    assert any(
+        sum(spec.competitor == "fixed_3p" for spec in matchup) == 2
+        for matchup in matchups
+    )
+
+
 def test_cli_defaults_to_100_games_and_accepts_override():
     parser = build_arg_parser()
-    assert parser.parse_args([]).games_per_matchup == 100
-    assert parser.parse_args(["--games-per-matchup", "7"]).games_per_matchup == 7
+    with pytest.raises(SystemExit):
+        parser.parse_args([])
+    assert parser.parse_args(["--players", "2"]).games_per_matchup == 100
+    assert parser.parse_args([
+        "--players", "3", "--games-per-matchup", "7"
+    ]).games_per_matchup == 7
 
 
 def test_fixed_and_variable_tensordicts_use_native_shapes_from_same_state():
@@ -112,7 +139,33 @@ def test_result_rows_record_seats_and_reciprocal_results(tmp_path):
     assert rows[0]["repetition"] == rows[1]["opponent_repetition"]
     assert rows[0]["points"] == rows[1]["opponent_points"]
     assert rows[0]["pudding"] == rows[1]["opponent_pudding"]
+    assert rows[0]["opponent_competitors"] == rows[0]["opponent_competitor"]
+    assert str(rows[0]["opponent_repetition"]) == rows[0]["opponent_repetitions"]
     assert [row["outcome"] for row in rows] == ["win", "loss"]
+
+
+def test_result_rows_support_multiple_opponents(tmp_path):
+    class Policy:
+        def __init__(self, competitor, repetition):
+            model = tmp_path / competitor / f"repetition_{repetition}" / "model.pt"
+            self.spec = CheckpointSpec(
+                competitor, repetition, model.parent, model, {}
+            )
+
+    seated = [
+        Policy("fixed_3p", 1),
+        Policy("fixed_3p", 2),
+        Policy("variable_2_4", 1),
+    ]
+    rows = result_rows(
+        seated, [40, 35, 40], [2, 5, 1], ("win", "loss", "loss"),
+        match_id="match_000001", matchup_id="matchup_0001", game_number=1,
+    )
+    assert len(rows) == 3
+    assert rows[0]["opponent_competitors"] == "fixed_3p|variable_2_4"
+    assert rows[0]["opponent_repetitions"] == "2|1"
+    assert rows[0]["opponent_points_all"] == "35|40"
+    assert rows[0]["opponent_puddings"] == "5|1"
 
 
 def test_play_game_uses_randomized_seat_assignment(tmp_path):
@@ -137,7 +190,7 @@ def test_play_game_uses_randomized_seat_assignment(tmp_path):
 
     policies = [FirstLegalPolicy("fixed_2p"), FirstLegalPolicy("variable_2_4")]
     rng = ReverseRng()
-    seated, points, puddings, game_outcomes = play_game(policies, rng=rng)
+    seated, points, puddings, game_outcomes = play_game(policies, players=2, rng=rng)
     assert rng.calls == 1
     assert [policy.spec.competitor for policy in seated] == [
         "variable_2_4", "fixed_2p"
@@ -153,13 +206,14 @@ def test_run_league_writes_two_rows_per_game(tmp_path, monkeypatch):
 
     policies = [Policy("fixed_2p"), Policy("variable_2_4")]
 
-    def fake_game(pair, rng):
+    def fake_game(pair, players, rng):
         assert rng is np.random
+        assert players == 2
         return list(reversed(pair)), [30, 30], [5, 5], ("tie", "tie")
 
     monkeypatch.setattr("league.run_league.play_game", fake_game)
     output_dir = tmp_path / "results"
-    assert run_league(policies, 3, output_dir, rng=np.random) == 3
+    assert run_league(policies, 3, output_dir, players=2, rng=np.random) == 3
     with (output_dir / "matches.csv").open(newline="", encoding="utf-8") as file:
         rows = list(csv.DictReader(file))
     assert len(rows) == 6
